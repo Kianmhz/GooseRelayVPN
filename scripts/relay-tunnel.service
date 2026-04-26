@@ -1,0 +1,15 @@
+[Unit]
+Description=relay-tunnel exit server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root
+ExecStart=/root/relay-server-linux -config /root/server_config.json
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
