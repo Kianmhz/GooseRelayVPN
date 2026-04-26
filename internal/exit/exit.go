@@ -17,6 +17,12 @@ import (
 )
 
 const (
+	// ActiveDrainWindow caps how long a batch that just performed real work
+	// (SYN/connect or non-empty uplink data) waits for downstream bytes.
+	// This limits head-of-line blocking when one slow target would otherwise
+	// hold the whole carrier loop for the full long-poll window.
+	ActiveDrainWindow = 2 * time.Second
+
 	// LongPollWindow is how long the handler holds open a request waiting for
 	// downstream bytes. UrlFetchApp has a practical read timeout of ~10s, so
 	// keep this comfortably below that.
@@ -108,8 +114,9 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		s.routeIncoming(f)
 	}
 
-	// Long-poll: wait for any downstream bytes, up to LongPollWindow.
-	deadline := time.Now().Add(LongPollWindow)
+	// Active batches use a shorter wait to avoid stalling unrelated sessions,
+	// while empty polls keep long-poll behavior for push responsiveness.
+	deadline := time.Now().Add(s.drainWindow(rxFrames))
 	for {
 		txFrames := s.drainAll()
 		if len(txFrames) > 0 {
@@ -159,6 +166,15 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			// loop one more time, then exit on next iteration
 		}
 	}
+}
+
+func (s *Server) drainWindow(rxFrames []*frame.Frame) time.Duration {
+	for _, f := range rxFrames {
+		if f.HasFlag(frame.FlagSYN) || len(f.Payload) > 0 {
+			return ActiveDrainWindow
+		}
+	}
+	return LongPollWindow
 }
 
 // routeIncoming routes one incoming frame to its session, creating the session
