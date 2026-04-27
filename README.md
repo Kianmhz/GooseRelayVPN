@@ -51,31 +51,23 @@ Your application sends TCP bytes through the SOCKS5 listener on your computer. T
 
 ## Step-by-Step Setup Guide
 
-### Step 1: Get a VPS for the exit server
+### Step 1: Get an outside-Iran VPS
 
-You need a small Linux VPS that Apps Script's `UrlFetchApp` can reach on TCP/8443. Any provider works; ~$4/month at DigitalOcean is plenty.
-
-- Create an Ubuntu droplet, note its public IP.
-- Open inbound TCP/8443 in the droplet's firewall.
-- Confirm you can `ssh user@droplet-ip` and that the user has `sudo`.
+You need a Linux VPS with a public IP that isn't blocked in Iran. Any provider works — DigitalOcean, Hetzner, Vultr, etc.
 
 ### Step 2: Get the binaries
 
-Pick one of the two paths below.
-
-**Option A — download a pre-built release (recommended if you don't want to install Go):**
+**Option A — Download a pre-built release (recommended):**
 
 1. Go to the [Releases page](https://github.com/kianmhz/GooseRelayVPN/releases).
-2. Download the archive that matches your computer:
-   - Windows: `GooseRelayVPN-vX.Y.Z-windows-amd64.zip`
-   - macOS (Intel): `GooseRelayVPN-vX.Y.Z-darwin-amd64.tar.gz`
-   - macOS (Apple Silicon / M1/M2/M3): `GooseRelayVPN-vX.Y.Z-darwin-arm64.tar.gz`
-   - Linux: `GooseRelayVPN-vX.Y.Z-linux-amd64.tar.gz`
-3. Unzip/untar it. Inside you'll find `goose-client`, `goose-server`, the example configs, and the Apps Script source.
+2. Download the right archive for your OS:
+   - Windows: `GooseRelayVPN-client-vX.Y.Z-windows-amd64.zip`
+   - macOS (Intel): `GooseRelayVPN-client-vX.Y.Z-darwin-amd64.tar.gz`
+   - macOS (M1/M2/M3): `GooseRelayVPN-client-vX.Y.Z-darwin-arm64.tar.gz`
+   - Linux: `GooseRelayVPN-client-vX.Y.Z-linux-amd64.tar.gz`
+3. Extract it. You'll find `goose-client` and an example config inside.
 
-You can also `cd` into that folder and follow the rest of the setup from there — every command below works the same.
-
-**Option B — build from source (Go 1.22+):**
+**Option B — Build from source (Go 1.22+):**
 
 ```bash
 git clone https://github.com/kianmhz/GooseRelayVPN.git
@@ -84,15 +76,15 @@ go build -o goose-client ./cmd/client
 go build -o goose-server ./cmd/server
 ```
 
-Or with the included Makefile: `make build` (puts binaries in `bin/`).
+### Step 3: Generate a secret key
 
-### Step 3: Generate an AES-256 key
+Run this once:
 
 ```bash
 bash scripts/gen-key.sh
 ```
 
-Copy the 64-character hex string. You'll paste the **same value** into both config files in the next step. This is the only authentication between client and server — protect it.
+Copy the 64-character string it prints. You'll use the **same value** in both the client and server configs. Keep it secret — anyone with this key can use your tunnel.
 
 ### Step 4: Configure
 
@@ -100,10 +92,10 @@ Copy the example configs:
 
 ```bash
 cp client_config.example.json client_config.json
-cp server_config.example.json   server_config.json
+cp server_config.example.json server_config.json
 ```
 
-Open both and paste the AES hex string into `tunnel_key` (client) and `tunnel_key` (server). Leave `script_keys` empty for now — you'll fill it in after Step 5.
+Open both files and paste your key into the `tunnel_key` field. Leave `script_keys` empty for now.
 
 `client_config.json`:
 
@@ -113,7 +105,7 @@ Open both and paste the AES hex string into `tunnel_key` (client) and `tunnel_ke
   "socks_port":  1080,
   "google_host": "216.239.38.120",
   "sni":         "www.google.com",
-  "script_keys": ["PASTE_DEPLOYMENT_ID", "OPTIONAL_SECOND_DEPLOYMENT_ID"],
+  "script_keys": ["PASTE_DEPLOYMENT_ID"],
   "tunnel_key":  "PASTE_OUTPUT_OF_GEN_KEY"
 }
 ```
@@ -128,49 +120,41 @@ Open both and paste the AES hex string into `tunnel_key` (client) and `tunnel_ke
 }
 ```
 
-### Step 5: Deploy the Apps Script forwarder
+### Step 5: Set up the Google Apps Script
 
-This is the dumb pipe that disguises your traffic as Google.
+This is the free Google-side piece that hides your traffic.
 
-1. Open [Google Apps Script](https://script.google.com/) and sign in.
+1. Go to [Google Apps Script](https://script.google.com/) and sign in.
 2. Click **New project**.
-3. Delete the default code.
-4. Open [`apps_script/Code.gs`](apps_script/Code.gs) from this repo, copy everything, paste into the editor.
-5. Change this line to your droplet's IP:
+3. Delete the default code and paste everything from [`apps_script/Code.gs`](apps_script/Code.gs).
+4. Change this line to your VPS IP:
    ```javascript
-   const DO_URL = 'http://YOUR.DROPLET.IP:8443/tunnel';
+   const DO_URL = 'http://YOUR.VPS.IP:8443/tunnel';
    ```
-6. Click **Deploy → New deployment** (gear icon → **Web app**).
-7. Set:
-   - **Execute as:** Me
-   - **Who has access:** Anyone
-8. Click **Deploy** and copy the deployment ID from the `/exec` URL (the part between `/s/` and `/exec`).
-9. Add that value to the `script_keys` array in `client_config.json`. If you deploy more than one script, list all the Deployment IDs in the array.
+5. Click **Deploy → New deployment** → set type to **Web app**.
+6. Set **Execute as:** Me and **Who has access:** Anyone.
+7. Click **Deploy** and copy the Deployment ID from the URL (the long string between `/s/` and `/exec`).
+8. Paste that ID into `script_keys` in `client_config.json`.
 
-> ⚠️ **Editing the script doesn't update the live version.** Every time you change `Code.gs` you must create a **new deployment** and update `script_keys` in your client config.
+> ⚠️ Every time you edit `Code.gs` you must create a **new deployment** and update `script_keys`.
 
-Verify the deployment:
+### Step 6: Install the server on your VPS
 
-```bash
-curl "$YOUR_SCRIPT_URL"
-# should print: GooseRelayVPN forwarder OK
-```
-
-### Step 6: Deploy the exit server
-
-A helper script builds a Linux binary, ships it to your droplet, and installs a systemd unit:
+SSH into your VPS and run:
 
 ```bash
-bash scripts/deploy.sh user@your.droplet.ip
+bash scripts/deploy.sh
 ```
 
-Verify it's live:
+Then check it's running:
 
 ```bash
-curl http://your.droplet.ip:8443/healthz   # HTTP 200, empty body
+curl http://YOUR.VPS.IP:8443/healthz
 ```
 
-### Step 7: Run the client locally
+You should get an empty 200 response.
+
+### Step 7: Run the client
 
 ```bash
 ./goose-client -config client_config.json
@@ -182,21 +166,13 @@ You should see:
 [client] SOCKS5 listening on 127.0.0.1:1080
 ```
 
-### Step 8: Use it
+This should print your **VPS IP**, not your own.
 
-Smoke test:
-
-```bash
-curl -x socks5h://127.0.0.1:1080 https://api.ipify.org
-```
-
-This should print your **droplet's** IP, not your home IP.
-
-Configure your browser/system to use SOCKS5 `127.0.0.1:1080`. **Use `socks5h://`** (not `socks5://`) so DNS travels through the tunnel — otherwise hostnames get resolved on your local network and the proxy never sees them.
+Now set your browser to use SOCKS5 proxy `127.0.0.1:1080`:
 
 - **Firefox:** Settings → Network Settings → Manual proxy → SOCKS5 host `127.0.0.1` port `1080`. Check **Proxy DNS when using SOCKS v5**.
-- **Chrome/Edge:** Use a proxy-switching extension (FoxyProxy, SwitchyOmega). Native OS proxy settings don't speak SOCKS5 with remote DNS cleanly.
-- **System-wide on macOS/Linux:** SOCKS5 proxy in network settings.
+- **Chrome/Edge:** Use an extension like FoxyProxy or SwitchyOmega.
+- **System-wide on macOS/Linux:** Set SOCKS5 in network settings.
 
 ---
 

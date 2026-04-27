@@ -51,31 +51,23 @@
 
 ## راه‌اندازی مرحله‌به‌مرحله
 
-### مرحله ۱: تهیه‌ی VPS برای سرور خروجی
+### مرحله ۱: تهیه‌ی یک VPS خارج از ایران
 
-به یک VPS لینوکسی کوچک نیاز دارید که `UrlFetchApp` در Apps Script بتواند از طریق TCP/8443 به آن برسد. هر ارائه‌دهنده‌ای کار می‌کند؛ یک دراپلت ~۴ دلاری در ماه از DigitalOcean کافی است.
-
-- یک دراپلت Ubuntu بسازید و IP عمومی آن را یادداشت کنید.
-- پورت TCP/8443 را در فایروال دراپلت برای ورودی باز کنید.
-- اطمینان حاصل کنید که می‌توانید با `ssh user@droplet-ip` متصل شوید و کاربر شما `sudo` دارد.
+به یک سرور لینوکسی خارج از ایران نیاز دارید. هر پروایدری کار می‌کند (DigitalOcean، Hetzner، Vultr و غیره).
 
 ### مرحله ۲: تهیه‌ی باینری‌ها
 
-یکی از دو روش زیر را انتخاب کنید.
-
-**گزینه‌ی الف — دانلود باینری آماده (پیشنهاد می‌شود اگر نمی‌خواهید Go نصب کنید):**
+**گزینه‌ی الف — دانلود نسخه‌ی آماده (پیشنهادی):**
 
 ۱. به [صفحه‌ی Releases](https://github.com/kianmhz/GooseRelayVPN/releases) بروید.
-۲. آرشیو متناسب با کامپیوترتان را دانلود کنید:
-   - ویندوز: `GooseRelayVPN-vX.Y.Z-windows-amd64.zip`
-   - مک (Intel): `GooseRelayVPN-vX.Y.Z-darwin-amd64.tar.gz`
-   - مک (Apple Silicon / M1/M2/M3): `GooseRelayVPN-vX.Y.Z-darwin-arm64.tar.gz`
-   - لینوکس: `GooseRelayVPN-vX.Y.Z-linux-amd64.tar.gz`
-۳. آن را extract کنید. داخلش `goose-client`، `goose-server`، فایل‌های نمونه‌ی کانفیگ و سورس Apps Script را می‌بینید.
+۲. فایل مناسب سیستم‌عامل خودتان را دانلود کنید:
+   - ویندوز: `GooseRelayVPN-client-vX.Y.Z-windows-amd64.zip`
+   - مک (Intel): `GooseRelayVPN-client-vX.Y.Z-darwin-amd64.tar.gz`
+   - مک (M1/M2/M3): `GooseRelayVPN-client-vX.Y.Z-darwin-arm64.tar.gz`
+   - لینوکس: `GooseRelayVPN-client-vX.Y.Z-linux-amd64.tar.gz`
+۳. فایل را extract کنید. داخلش `goose-client` و یک فایل نمونه‌ی کانفیگ هست.
 
-می‌توانید وارد همان پوشه شوید و بقیه‌ی مراحل را از آنجا ادامه دهید — همه‌ی دستورهای پایین به‌همان شکل کار می‌کنند.
-
-**گزینه‌ی ب — ساخت از سورس (Go نسخه‌ی ۱.۲۲ یا بالاتر):**
+**گزینه‌ی ب — ساخت از سورس (Go 1.22+):**
 
 ```bash
 git clone https://github.com/kianmhz/GooseRelayVPN.git
@@ -84,26 +76,26 @@ go build -o goose-client ./cmd/client
 go build -o goose-server ./cmd/server
 ```
 
-یا با Makefile همراه پروژه: `make build` (باینری‌ها در پوشه‌ی `bin/` ساخته می‌شوند).
+### مرحله ۳: ساخت یک کلید مخفی
 
-### مرحله ۳: ساخت کلید AES-256
+این دستور را یک‌بار اجرا کنید:
 
 ```bash
 bash scripts/gen-key.sh
 ```
 
-رشته‌ی hex با ۶۴ کاراکتر را کپی کنید. در مرحله‌ی بعد همین مقدار را در **هر دو** فایل کانفیگ paste می‌کنید. این تنها مکانیزم احراز هویت بین کلاینت و سرور است — مراقب آن باشید.
+رشته‌ی ۶۴ کاراکتری که چاپ می‌شود را کپی کنید. همین مقدار را در **هر دو** کانفیگ (کلاینت و سرور) باید بگذارید. این کلید را محرمانه نگه دارید — هر کسی آن را داشته باشد می‌تواند از تونل شما استفاده کند.
 
 ### مرحله ۴: تنظیم کانفیگ
 
-ابتدا فایل‌های نمونه را کپی کنید:
+فایل‌های نمونه را کپی کنید:
 
 ```bash
 cp client_config.example.json client_config.json
-cp server_config.example.json   server_config.json
+cp server_config.example.json server_config.json
 ```
 
-هر دو را باز کنید و رشته‌ی hex را در فیلد `tunnel_key` (در کلاینت) و `tunnel_key` (در سرور) قرار دهید. مقدار `script_keys` را فعلاً خالی بگذارید — بعد از مرحله‌ی ۵ آن را پر می‌کنید.
+هر دو را باز کنید و کلید خود را در فیلد `tunnel_key` قرار دهید. فعلاً `script_keys` را خالی بگذارید.
 
 `client_config.json`:
 
@@ -113,7 +105,7 @@ cp server_config.example.json   server_config.json
   "socks_port":  1080,
   "google_host": "216.239.38.120",
   "sni":         "www.google.com",
-  "script_keys": ["PASTE_DEPLOYMENT_ID", "OPTIONAL_SECOND_DEPLOYMENT_ID"],
+  "script_keys": ["PASTE_DEPLOYMENT_ID"],
   "tunnel_key":  "PASTE_OUTPUT_OF_GEN_KEY"
 }
 ```
@@ -124,53 +116,45 @@ cp server_config.example.json   server_config.json
 {
   "server_host": "0.0.0.0",
   "server_port": 8443,
-  "tunnel_key": "SAME_VALUE_AS_CLIENT"
+  "tunnel_key":  "SAME_VALUE_AS_CLIENT"
 }
 ```
 
-### مرحله ۵: deploy کردن forwarder روی Apps Script
+### مرحله ۵: راه‌اندازی Google Apps Script
 
-این بخش همان پل ساده‌ای است که ترافیک شما را شبیه ترافیک گوگل نشان می‌دهد.
+این بخش رایگان است و ترافیک شما را از طریق سرورهای گوگل عبور می‌دهد.
 
 1. وارد [Google Apps Script](https://script.google.com/) شوید.
 2. روی **New project** کلیک کنید.
-3. کد پیش‌فرض را کاملاً حذف کنید.
-4. فایل [`apps_script/Code.gs`](apps_script/Code.gs) همین پروژه را باز کنید، همه‌ی محتوای آن را کپی کنید و در ویرایشگر Apps Script paste کنید.
-5. این خط را به IP دراپلت خودتان تغییر دهید:
+3. کد پیش‌فرض را حذف کنید و محتوای فایل [`apps_script/Code.gs`](apps_script/Code.gs) را paste کنید.
+4. این خط را به IP سرور خودتان تغییر دهید:
    ```javascript
-   const DO_URL = 'http://YOUR.DROPLET.IP:8443/tunnel';
+   const DO_URL = 'http://YOUR.VPS.IP:8443/tunnel';
    ```
-6. روی **Deploy → New deployment** کلیک کنید (آیکون چرخ‌دنده → **Web app**).
-7. این تنظیمات را انتخاب کنید:
-   - **Execute as:** Me
-   - **Who has access:** Anyone
-8. روی **Deploy** بزنید و Deployment ID را از آدرس `/exec` بردارید (بخشی که بین `/s/` و `/exec` است).
-9. این مقدار را به آرایه‌ی `script_keys` در فایل `client_config.json` اضافه کنید. اگر بیش از یک deployment ساختید، همه‌ی Deployment IDها را در همین آرایه قرار دهید.
+5. روی **Deploy → New deployment** کلیک کنید و نوع را **Web app** انتخاب کنید.
+6. **Execute as:** Me و **Who has access:** Anyone را انتخاب کنید.
+7. روی **Deploy** بزنید و Deployment ID را از URL بردارید (رشته‌ی طولانی بین `/s/` و `/exec`).
+8. آن را در `script_keys` داخل `client_config.json` قرار دهید.
 
-> ⚠️ **ویرایش اسکریپت، نسخه‌ی فعال را به‌روزرسانی نمی‌کند.** هر بار که `Code.gs` را تغییر می‌دهید باید **یک deployment جدید** بسازید و `script_keys` را در کانفیگ کلاینت به‌روزرسانی کنید.
+> ⚠️ هر بار که `Code.gs` را ویرایش کنید باید **یک deployment جدید** بسازید و `script_keys` را آپدیت کنید.
 
-تست deployment:
+### مرحله ۶: نصب سرور روی VPS
 
-```bash
-curl "$YOUR_SCRIPT_URL"
-# باید چاپ کند: GooseRelayVPN forwarder OK
-```
-
-### مرحله ۶: deploy کردن سرور خروجی
-
-یک اسکریپت کمکی، باینری لینوکس را می‌سازد، روی دراپلت کپی می‌کند و یک systemd unit نصب می‌کند:
+به VPS خود SSH بزنید و این دستور را اجرا کنید:
 
 ```bash
-bash scripts/deploy.sh user@your.droplet.ip
+bash scripts/deploy.sh
 ```
 
-تأیید کنید که سرور بالا است:
+سپس بررسی کنید که سرور در حال اجرا است:
 
 ```bash
-curl http://your.droplet.ip:8443/healthz   # HTTP 200، body خالی
+curl http://YOUR.VPS.IP:8443/healthz
 ```
 
-### مرحله ۷: اجرای کلاینت روی کامپیوتر محلی
+باید پاسخ ۲۰۰ دریافت کنید.
+
+### مرحله ۷: اجرای کلاینت
 
 ```bash
 ./goose-client -config client_config.json
@@ -182,20 +166,12 @@ curl http://your.droplet.ip:8443/healthz   # HTTP 200، body خالی
 [client] SOCKS5 listening on 127.0.0.1:1080
 ```
 
-### مرحله ۸: استفاده
+این باید **IP سرور شما** را نشان دهد، نه IP خودتان.
 
-تست سریع:
-
-```bash
-curl -x socks5h://127.0.0.1:1080 https://api.ipify.org
-```
-
-این دستور باید **IP دراپلت شما** را چاپ کند، نه IP خانگی‌تان.
-
-مرورگر/سیستم خود را روی پراکسی SOCKS5 آدرس `127.0.0.1:1080` تنظیم کنید. **حتماً از `socks5h://` استفاده کنید** (نه `socks5://`) تا DNS هم از تونل عبور کند — در غیر این صورت نام دامنه‌ها در شبکه‌ی محلی شما resolve می‌شود و پراکسی هرگز آن‌ها را نمی‌بیند.
+حالا مرورگرتان را روی پراکسی SOCKS5 آدرس `127.0.0.1:1080` تنظیم کنید:
 
 - **Firefox:** Settings → Network Settings → Manual proxy → SOCKS5 host `127.0.0.1` port `1080`. گزینه‌ی **Proxy DNS when using SOCKS v5** را فعال کنید.
-- **Chrome/Edge:** از یک افزونه‌ی proxy-switcher استفاده کنید (FoxyProxy، SwitchyOmega). تنظیمات پراکسی پیش‌فرض سیستم‌عامل به‌خوبی با SOCKS5h و remote DNS کار نمی‌کنند.
+- **Chrome/Edge:** از افزونه‌ای مثل FoxyProxy یا SwitchyOmega استفاده کنید.
 - **macOS / Linux:** پراکسی SOCKS5 در تنظیمات شبکه.
 
 ---
