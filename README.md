@@ -59,9 +59,23 @@ You need a small Linux VPS that Apps Script's `UrlFetchApp` can reach on TCP/844
 - Open inbound TCP/8443 in the droplet's firewall.
 - Confirm you can `ssh user@droplet-ip` and that the user has `sudo`.
 
-### Step 2: Clone and build
+### Step 2: Get the binaries
 
-Requires Go 1.22+ on your local machine.
+Pick one of the two paths below.
+
+**Option A — download a pre-built release (recommended if you don't want to install Go):**
+
+1. Go to the [Releases page](https://github.com/kianmhz/relay-tunnel/releases).
+2. Download the archive that matches your computer:
+   - Windows: `relay-tunnel-vX.Y.Z-windows-amd64.zip`
+   - macOS (Intel): `relay-tunnel-vX.Y.Z-darwin-amd64.tar.gz`
+   - macOS (Apple Silicon / M1/M2/M3): `relay-tunnel-vX.Y.Z-darwin-arm64.tar.gz`
+   - Linux: `relay-tunnel-vX.Y.Z-linux-amd64.tar.gz`
+3. Unzip/untar it. Inside you'll find `relay-client`, `relay-server`, the example configs, and the Apps Script source.
+
+You can also `cd` into that folder and follow the rest of the setup from there — every command below works the same.
+
+**Option B — build from source (Go 1.22+):**
 
 ```bash
 git clone https://github.com/kianmhz/relay-tunnel.git
@@ -69,6 +83,8 @@ cd relay-tunnel
 go build -o relay-client ./cmd/client
 go build -o relay-server ./cmd/server
 ```
+
+Or with the included Makefile: `make build` (puts binaries in `bin/`).
 
 ### Step 3: Generate an AES-256 key
 
@@ -193,6 +209,32 @@ By default the client listens on `127.0.0.1:1080` so only your computer can use 
 
 ---
 
+## Increase capacity with multiple deployments (recommended)
+
+Each Google account's Apps Script deployment is rate-limited to **~20,000 calls/day**. The client polls about once per second when idle, so a single deployment can sustain steady use, but heavy days hit the cap. To go beyond that, deploy `Code.gs` multiple times — under the same Google account or a few different ones — and put all the Deployment IDs into `script_keys`:
+
+```json
+{
+  "script_key":  "PRIMARY_DEPLOYMENT_ID",
+  "script_keys": [
+    "SECOND_DEPLOYMENT_ID",
+    "THIRD_DEPLOYMENT_ID"
+  ]
+}
+```
+
+What the client does for you automatically:
+
+- **Round-robin** across all configured deployments.
+- **Health-aware blacklist** — if one starts failing, the client backs off from it (3 s, 6 s, 12 s, … up to ~48 s) and keeps using the others.
+- **Same-poll failover** — if a poll fails on one deployment, the same payload is retried on another within the same poll cycle, so no traffic is lost during transient quota or 5xx events.
+
+> 💡 All deployments must use **the same `tunnel_key`** because they all forward to the same VPS, which only has one AES key. You don't need to change anything on the VPS when you add more deployments.
+
+> 💡 You can paste either just the Deployment ID (the part between `/s/` and `/exec`) or the full `/exec` URL — the client extracts the ID either way.
+
+---
+
 ## Configuration
 
 ### Client (`client_config.json`)
@@ -239,7 +281,8 @@ Key invariants:
 - **Authentication = AES-GCM tag.** No shared password, no certificates. Frames that fail `Open()` are dropped silently.
 - **Apps Script never sees plaintext.** The script is a ~30-line forwarder; the AES key lives only on your machine and the VPS.
 - **DNS travels through the tunnel.** The SOCKS5 server uses a no-op resolver; use `socks5h://` so DNS is resolved at the exit, not locally.
-- **Long-poll, full-duplex.** The VPS holds each request open for 8s waiting for downstream bytes; the client reposts as soon as it returns. Two HTTP exchanges in flight at once give a full-duplex pipe.
+- **Long-poll, full-duplex.** The VPS holds each request open for 8s waiting for downstream bytes; the client reposts as soon as it returns. Two HTTP exchanges in flight at once give a full-duplex pipe. Downstream frames are coalesced in a small (~25 ms) window so streaming workloads send fewer, larger HTTP responses.
+- **Health-aware multi-deployment.** When `script_keys` lists more than one deployment, the client picks endpoints in round-robin and exponentially blacklists any that misbehave; one same-poll retry is attempted on a fresh deployment so transient failures don't drop traffic.
 
 ### Wire format
 
@@ -279,16 +322,16 @@ relay-tunnel/
 
 | Problem | Solution |
 |---|---|
-| `decode batch: illegal base64 data at input byte 0` | Apps Script returned an HTML page instead of an encrypted batch. Either `script_key`/`script_keys` does not point at a live deployment, or **Who has access** is not set to `Anyone`. Re-deploy (Deploy -> **New deployment**) and update `script_key`/`script_keys` in `client_config.json`. |
-| `[carrier] non-OK status: 404` | Same root cause as above — the `/exec` URL isn't live. Re-deploy. |
-| `[carrier] non-OK status: 500` | Apps Script can't reach `DO_URL`. Check the IP in `Code.gs`, confirm the VPS is up, and confirm inbound TCP/8443 is open. `curl http://your.vps.ip:8443/healthz` should return 200. |
-| `[carrier] post: ... timeout` | Fronted connection to Google is failing. Try a different `google_ip` — any 216.239.x.120 served by Google works. |
+| Log says `decode batch: ... base64 ...` | Apps Script returned an HTML page instead of an encrypted batch. Either the deployment in `script_key`/`script_keys` isn't live, or **Who has access** is not set to `Anyone`. Re-deploy (Deploy → **New deployment**) and update `script_key`/`script_keys` in `client_config.json`. |
+| Log says `relay returned HTTP 404 via …` | Same root cause as above — the deployment ID in your config doesn't match a live `/exec`. Re-deploy and update the config. |
+| Log says `relay returned HTTP 500 via …` | Apps Script can't reach `DO_URL`. Check the IP in `Code.gs`, confirm the VPS is up, and confirm inbound TCP/8443 is open. `curl http://your.vps.ip:8443/healthz` should return 200. |
+| Log says `relay request failed via …: timeout` | Fronted connection to Google is failing. Try a different `google_host` — any 216.239.x.120 served by Google works. |
 | Browser hangs on every request | You're using `socks5://` instead of `socks5h://`. The non-`h` form resolves DNS locally and the proxy gets called with raw IPs. |
-| `[exit] dial X: ... timeout` on the server | The target host blocks datacenter IPs, or your VPS has no outbound connectivity for that port. |
+| `[exit] dial X: ... timeout` on the VPS server logs | The target host blocks datacenter IPs, or your VPS has no outbound connectivity for that port. |
 | Cloudflare-protected sites show captchas | Expected. Your VPS's IP is on a datacenter ASN (DigitalOcean = AS14061), which Cloudflare's bot scoring flags. Not a tunnel bug. |
-| YouTube buffers a lot at 1080p | Expected. The tunnel adds ~300-800ms per round trip due to Apps Script dispatch overhead. 480p is comfortable. |
-| Apps Script quota exhausted | Each free Google account gets ~20,000 `UrlFetchApp` calls per 24h. Heavy usage hits this. Wait until quota resets at midnight Pacific time (10:30 AM Iran time) or deploy under a second account. |
-| Mismatched AES keys | Symptom: client logs no errors but no traffic flows; VPS logs `dial ...` lines never appear. Confirm `tunnel_key` is byte-identical in both configs. |
+| YouTube buffers a lot at 1080p | Expected. The tunnel adds ~300-800ms per round trip due to Apps Script dispatch overhead. 480p is comfortable. Deploying multiple `script_keys` (see above) helps with sustained throughput. |
+| One deployment hits quota mid-session | If you have other entries in `script_keys`, the client automatically blacklists the failing one for a few seconds and keeps going on the others. With only one `script_key`, browsing stops until the quota resets (10:30 AM Iran time / midnight Pacific). |
+| Mismatched AES keys (`tunnel_key`) | Symptom: client logs no errors but no traffic flows; VPS logs `dial ...` lines never appear. Confirm `tunnel_key` is byte-identical in both configs. |
 
 ---
 
