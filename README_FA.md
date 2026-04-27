@@ -66,7 +66,6 @@
    - مک (M1/M2/M3): `GooseRelayVPN-client-vX.Y.Z-darwin-arm64.tar.gz`
    - لینوکس: `GooseRelayVPN-client-vX.Y.Z-linux-amd64.tar.gz`
   - اندروید / Termux (arm64): `GooseRelayVPN-client-vX.Y.Z-android-arm64.tar.gz`
-  - اندروید / Termux (armv7): `GooseRelayVPN-client-vX.Y.Z-android-armv7.tar.gz`
 ۳. فایل را extract کنید. داخلش `goose-client` و یک فایل نمونه‌ی کانفیگ هست.
 
 **گزینه‌ی ب — ساخت از سورس (Go 1.22+):**

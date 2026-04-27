@@ -40,8 +40,6 @@ jobs:
       matrix:
         include:
           - goarch: arm64
-          - goarch: arm
-            goarm: 7
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

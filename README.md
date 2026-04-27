@@ -66,7 +66,6 @@ You need a Linux VPS with a public IP. Any provider works.
    - macOS (M1/M2/M3): `GooseRelayVPN-client-vX.Y.Z-darwin-arm64.tar.gz`
    - Linux: `GooseRelayVPN-client-vX.Y.Z-linux-amd64.tar.gz`
   - Android / Termux (arm64): `GooseRelayVPN-client-vX.Y.Z-android-arm64.tar.gz`
-  - Android / Termux (armv7): `GooseRelayVPN-client-vX.Y.Z-android-armv7.tar.gz`
 3. Extract it. You'll find `goose-client` and an example config inside.
 
 **Option B — Build from source (Go 1.22+):**

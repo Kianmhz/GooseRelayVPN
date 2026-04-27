@@ -31,7 +31,7 @@ clean:
 
 # Local cross-compile dry run, mirroring the GitHub release matrix.
 release-local:
-	@for entry in linux/amd64 linux/arm64 linux/armv7 windows/amd64 windows/arm64 darwin/amd64 darwin/arm64 android/arm64 android/armv7; do \
+	@for entry in linux/amd64 linux/arm64 linux/armv7 windows/amd64 windows/arm64 darwin/amd64 darwin/arm64 android/arm64; do \
 	  os=$${entry%%/*}; rest=$${entry#*/}; \
 	  arch=$${rest%%v*}; arm=$$(echo $$rest | grep -oP '(?<=v)\d' || true); \
 	  plat=$$os-$$arch$$([ -n "$$arm" ] && echo "v$$arm" || true); \

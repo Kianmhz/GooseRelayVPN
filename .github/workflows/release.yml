@@ -33,9 +33,6 @@ jobs:
             goarch: arm64
           - goos: android
             goarch: arm64
-          - goos: android
-            goarch: arm
-            goarm: 7
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
