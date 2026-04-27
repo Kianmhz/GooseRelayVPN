@@ -3,7 +3,6 @@ package frame
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/binary"
 	"strings"
 	"testing"
 )
@@ -110,35 +109,19 @@ func TestDecodeBatch_EmptyBody(t *testing.T) {
 	}
 }
 
-// A batch with one tampered frame should still decode the surviving frames.
-func TestDecodeBatch_TamperedFrameDropped(t *testing.T) {
+// Tampering any byte in the ciphertext must cause the entire batch to be
+// rejected — the batch is authenticated as a single unit.
+func TestDecodeBatch_TamperedBatchFails(t *testing.T) {
 	c := newTestCrypto(t)
 	in := []*Frame{
 		{SessionID: sid(1), Seq: 0, Payload: []byte("good1")},
-		{SessionID: sid(1), Seq: 1, Payload: []byte("bad")},
-		{SessionID: sid(1), Seq: 2, Payload: []byte("good2")},
+		{SessionID: sid(1), Seq: 1, Payload: []byte("good2")},
 	}
 	body, _ := EncodeBatch(c, in)
 	raw, _ := base64.StdEncoding.DecodeString(string(body))
-	// Walk frames and tamper with the second one's tag.
-	off := 2
-	for i := 0; i < 3; i++ {
-		flen := int(binary.BigEndian.Uint32(raw[off:]))
-		off += 4
-		if i == 1 {
-			raw[off+flen-1] ^= 0x01
-		}
-		off += flen
-	}
+	raw[len(raw)/2] ^= 0x01 // flip a bit in the middle of the ciphertext
 	tampered := []byte(base64.StdEncoding.EncodeToString(raw))
-	out, err := DecodeBatch(c, tampered)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(out) != 2 {
-		t.Fatalf("want 2 surviving frames, got %d", len(out))
-	}
-	if string(out[0].Payload) != "good1" || string(out[1].Payload) != "good2" {
-		t.Fatalf("survivors wrong: %q %q", out[0].Payload, out[1].Payload)
+	if _, err := DecodeBatch(c, tampered); err == nil {
+		t.Fatal("expected auth error on tampered batch, got nil")
 	}
 }
