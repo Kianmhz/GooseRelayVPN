@@ -134,10 +134,14 @@ func main() {
 		log.Printf("[client] mode: direct relay_urls (fronting disabled)")
 	}
 	log.Printf("[client] relay endpoints: %d (%s)", len(cfg.ScriptURLs), summarizeScriptURLs(cfg.ScriptURLs))
+	if cfg.DebugTiming {
+		log.Printf("[client] debug_timing enabled — per-session TTFB and per-poll RTT will be logged")
+	}
 
 	carr, err := carrier.New(carrier.Config{
-		ScriptURLs: cfg.ScriptURLs,
-		AESKeyHex:  cfg.AESKeyHex,
+		ScriptURLs:  cfg.ScriptURLs,
+		AESKeyHex:   cfg.AESKeyHex,
+		DebugTiming: cfg.DebugTiming,
 		Fronting: carrier.FrontingConfig{
 			GoogleIP: cfg.GoogleIP,
 			SNIHosts: cfg.SNIHosts,

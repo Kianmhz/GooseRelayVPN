@@ -14,8 +14,9 @@ import (
 
 // Server is the VPS exit server config.
 type Server struct {
-	ListenAddr string
-	AESKeyHex  string
+	ListenAddr  string
+	AESKeyHex   string
+	DebugTiming bool
 }
 
 type serverFile struct {
@@ -23,6 +24,10 @@ type serverFile struct {
 	ServerHost string `json:"server_host"`
 	ServerPort int    `json:"server_port"`
 	TunnelKey  string `json:"tunnel_key"`
+
+	// Optional: when true, log per-session dial breakdown (DNS, TCP, first
+	// upstream read) so an operator can pinpoint where latency is going.
+	DebugTiming bool `json:"debug_timing"`
 
 	// Legacy keys kept as fallback for existing deployments.
 	ListenAddr string `json:"listen_addr"`
@@ -82,8 +87,9 @@ func LoadServer(path string) (*Server, error) {
 	}
 
 	c := Server{
-		ListenAddr: net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
-		AESKeyHex:  key,
+		ListenAddr:  net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
+		AESKeyHex:   key,
+		DebugTiming: f.DebugTiming,
 	}
 	return &c, nil
 }

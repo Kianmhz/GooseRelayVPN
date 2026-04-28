@@ -76,16 +76,18 @@ const (
 
 // Config is the VPS server's configuration.
 type Config struct {
-	ListenAddr string // "0.0.0.0:8443"
-	AESKeyHex  string // 64-char hex
+	ListenAddr   string // "0.0.0.0:8443"
+	AESKeyHex    string // 64-char hex
+	DebugTiming  bool   // when true, log per-session dial breakdown and first-read latency
 }
 
 // Server holds the per-process session state.
 type Server struct {
-	cfg  Config
-	aead *frame.Crypto
-	dial func(network, address string, timeout time.Duration) (net.Conn, error)
-	dns  *dnsCache
+	cfg          Config
+	aead         *frame.Crypto
+	dial         func(network, address string, timeout time.Duration) (net.Conn, error)
+	dns          *dnsCache
+	debugTiming  bool
 
 	mu          sync.Mutex
 	sessions    map[[frame.SessionIDLen]byte]*session.Session
@@ -120,15 +122,16 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	return &Server{
-		cfg:        cfg,
-		aead:       aead,
-		dial:       net.DialTimeout,
-		dns:        newDNSCache(),
-		sessions:   make(map[[frame.SessionIDLen]byte]*session.Session),
-		txReady:    make(map[[frame.SessionIDLen]byte]struct{}),
-		firstReply: make(map[[frame.SessionIDLen]byte]struct{}),
-		dialFail:   make(map[string]time.Time),
-		activity:   make(chan struct{}, 1),
+		cfg:         cfg,
+		aead:        aead,
+		dial:        net.DialTimeout,
+		dns:         newDNSCache(),
+		debugTiming: cfg.DebugTiming,
+		sessions:    make(map[[frame.SessionIDLen]byte]*session.Session),
+		txReady:     make(map[[frame.SessionIDLen]byte]struct{}),
+		firstReply:  make(map[[frame.SessionIDLen]byte]struct{}),
+		dialFail:    make(map[string]time.Time),
+		activity:    make(chan struct{}, 1),
 	}, nil
 }
 
@@ -317,10 +320,11 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 // openSession dials the upstream target, creates a Session for the given ID,
 // registers it, and spawns the bidirectional pump goroutines.
 func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*session.Session, error) {
-	upstream, err := dialWithDNSCache(s.dns, s.dial, "tcp", target, 15*time.Second)
+	res, err := dialWithDNSCache(s.dns, s.dial, "tcp", target, 15*time.Second)
 	if err != nil {
 		return nil, err
 	}
+	upstream := res.Conn
 	// Disable Nagle's algorithm so small writes (TLS handshake records, HTTP
 	// request lines) hit the wire immediately instead of waiting up to 40 ms
 	// to coalesce. Interactive workloads dominate this tunnel; throughput-bound
@@ -328,6 +332,11 @@ func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*sessi
 	if tcpConn, ok := upstream.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
 	}
+	if s.debugTiming {
+		log.Printf("[timing] %x dial dns=%dms cached=%v tcp=%dms target=%s",
+			id[:4], res.DNS.Milliseconds(), res.DNSCached, res.TCP.Milliseconds(), target)
+	}
+	dialedAt := time.Now()
 	sess := session.New(id, target, false)
 	sess.OnTx = func() {
 		s.mu.Lock()
@@ -348,8 +357,16 @@ func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*sessi
 	go func() {
 		defer upstream.Close()
 		buf := make([]byte, upstreamReadBuf)
+		firstRead := true
 		for {
 			n, err := upstream.Read(buf)
+			if firstRead && n > 0 {
+				if s.debugTiming {
+					log.Printf("[timing] %x first_read=%dms after_dial target=%s",
+						id[:4], time.Since(dialedAt).Milliseconds(), target)
+				}
+				firstRead = false
+			}
 			if n > 0 {
 				sess.EnqueueTx(buf[:n])
 			}

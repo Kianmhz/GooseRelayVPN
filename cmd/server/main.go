@@ -22,8 +22,9 @@ func main() {
 	}
 
 	srv, err := exit.New(exit.Config{
-		ListenAddr: cfg.ListenAddr,
-		AESKeyHex:  cfg.AESKeyHex,
+		ListenAddr:  cfg.ListenAddr,
+		AESKeyHex:   cfg.AESKeyHex,
+		DebugTiming: cfg.DebugTiming,
 	})
 	if err != nil {
 		log.Fatalf("exit: %v", err)
@@ -35,6 +36,9 @@ func main() {
 	log.Printf("[exit] tunnel_key loaded (32 bytes)")
 	log.Printf("[exit] healthz: curl http://YOUR.VPS.IP:%s/healthz   (should return HTTP 200)", port)
 	log.Printf("[exit] tunnel : POST http://YOUR.VPS.IP:%s/tunnel    (this is the VPS_URL in Code.gs)", port)
+	if cfg.DebugTiming {
+		log.Printf("[exit] debug_timing enabled — per-session dial breakdown will be logged")
+	}
 
 	if err := srv.ListenAndServe(); err != nil {
 		msg := err.Error()

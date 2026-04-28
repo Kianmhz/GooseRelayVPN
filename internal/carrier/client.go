@@ -58,9 +58,10 @@ const (
 
 // Config bundles everything the carrier needs to talk to the relay.
 type Config struct {
-	ScriptURLs []string // one or more full https://script.google.com/macros/s/.../exec URLs
-	Fronting   FrontingConfig
-	AESKeyHex  string // 64-char hex, must match server
+	ScriptURLs  []string // one or more full https://script.google.com/macros/s/.../exec URLs
+	Fronting    FrontingConfig
+	AESKeyHex   string // 64-char hex, must match server
+	DebugTiming bool   // when true, log per-session TTFB and per-poll Apps Script RTT
 }
 
 type relayEndpoint struct {
@@ -120,6 +121,12 @@ type Client struct {
 	aead        *frame.Crypto
 	httpClients []*http.Client  // one per SNI host; round-robined per request
 	nextHTTP    atomic.Uint64   // round-robin index into httpClients
+	debugTiming bool
+
+	// debugStarts tracks session start times when debugTiming is on so we can
+	// log time-to-first-byte once each session receives its first downstream
+	// frame. Entries are deleted on first rx.
+	debugStarts sync.Map
 
 	mu       sync.Mutex
 	sessions map[[frame.SessionIDLen]byte]*session.Session
@@ -180,6 +187,7 @@ func New(cfg Config) (*Client, error) {
 		cfg:         cfg,
 		aead:        aead,
 		httpClients: NewFrontedClients(cfg.Fronting, pollTimeout),
+		debugTiming: cfg.DebugTiming,
 		sessions:    make(map[[frame.SessionIDLen]byte]*session.Session),
 		inFlight:    make(map[[frame.SessionIDLen]byte]bool),
 		txReady:     make(map[[frame.SessionIDLen]byte]struct{}),
@@ -210,6 +218,9 @@ func (c *Client) NewSession(target string) *session.Session {
 	c.txReady[id] = struct{}{} // SYN is pending immediately on creation
 	c.mu.Unlock()
 	c.stats.sessionsOpen.Add(1)
+	if c.debugTiming {
+		c.debugStarts.Store(id, time.Now())
+	}
 	c.kick()
 	return s
 }
@@ -331,6 +342,10 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 		req.Header.Set("Content-Type", "text/plain")
 		attempted = true
 
+		var pollStart time.Time
+		if c.debugTiming {
+			pollStart = time.Now()
+		}
 		resp, err := c.pickHTTPClient().Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -410,6 +425,10 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 		pollOK = true
 		countFrameBytes(&c.stats.framesOut, &c.stats.bytesOut, frames)
 		countFrameBytes(&c.stats.framesIn, &c.stats.bytesIn, rxFrames)
+		if c.debugTiming {
+			log.Printf("[timing] poll rtt=%dms tx_frames=%d rx_frames=%d resp_bytes=%d via %s",
+				time.Since(pollStart).Milliseconds(), len(frames), len(rxFrames), len(respBody), shortScriptKey(scriptURL))
+		}
 		return len(frames) > 0 || len(rxFrames) > 0
 	}
 
@@ -597,6 +616,15 @@ func (c *Client) routeRx(f *frame.Frame) {
 	if !ok {
 		return // unknown session - drop
 	}
+	if c.debugTiming && len(f.Payload) > 0 {
+		// First downstream frame for a session implies time-to-first-byte.
+		// LoadAndDelete ensures we log this exactly once per session.
+		if start, loaded := c.debugStarts.LoadAndDelete(f.SessionID); loaded {
+			ttfb := time.Since(start.(time.Time))
+			log.Printf("[timing] %x ttfb=%dms target=%s",
+				f.SessionID[:4], ttfb.Milliseconds(), s.Target)
+		}
+	}
 	if f.HasFlag(frame.FlagRST) {
 		// Server has no state for this session (e.g. it restarted). Tear it down
 		// immediately so the SOCKS client gets an error and reconnects cleanly.
@@ -607,6 +635,9 @@ func (c *Client) routeRx(f *frame.Frame) {
 		delete(c.sessions, f.SessionID)
 		delete(c.txReady, f.SessionID)
 		c.mu.Unlock()
+		if c.debugTiming {
+			c.debugStarts.Delete(f.SessionID)
+		}
 		s.Stop()
 		c.stats.rstFromServer.Add(1)
 		c.stats.sessionsClose.Add(1)
@@ -623,6 +654,9 @@ func (c *Client) gcDoneSessions() {
 			s.Stop()
 			delete(c.sessions, id)
 			delete(c.txReady, id)
+			if c.debugTiming {
+				c.debugStarts.Delete(id)
+			}
 			c.stats.sessionsClose.Add(1)
 		}
 	}

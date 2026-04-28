@@ -23,6 +23,7 @@ type Client struct {
 	ScriptURLs  []string // one or more relay endpoints (Apps Script URLs or direct relay_urls)
 	UseFronting bool
 	AESKeyHex   string // 64-char hex
+	DebugTiming bool   // when true, log per-session TTFB and per-poll Apps Script RTT
 }
 
 // clientFile is the user-friendly client config format.
@@ -50,6 +51,11 @@ type clientFile struct {
 
 	// Shared AES key (64-char hex).
 	TunnelKey string `json:"tunnel_key"`
+
+	// Optional: when true, log per-session time-to-first-byte and per-poll
+	// Apps Script round-trip latency to help pinpoint where a slow connection
+	// is spending its time. Off by default.
+	DebugTiming bool `json:"debug_timing"`
 }
 
 func firstNonEmpty(values ...string) string {
@@ -279,6 +285,7 @@ func LoadClient(path string) (*Client, error) {
 		ScriptURLs:  scriptURLs,
 		UseFronting: useFronting,
 		AESKeyHex:   key,
+		DebugTiming: f.DebugTiming,
 	}
 	return &c, nil
 }

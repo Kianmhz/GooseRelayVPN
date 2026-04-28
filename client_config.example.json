@@ -1,4 +1,5 @@
 {
+  "debug_timing": false,
   "socks_host": "127.0.0.1",
   "socks_port": 1080,
   "google_host": "216.239.38.120",
