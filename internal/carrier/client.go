@@ -100,7 +100,19 @@ type relayEndpoint struct {
 	ewmaRTT     time.Duration
 	lastSuccess time.Time
 	firstFail   time.Time // when the most recent failure streak began
+
+	// loggedNonBatchSnippetAt rate-limits the diagnostic body-snippet
+	// log so a sustained failure stream produces at most one snippet
+	// per loggedNonBatchSnippetCooldown — enough to identify the root
+	// cause (quota page, SSO interstitial, dead deployment) without
+	// flooding the log with the same snippet thousands of times.
+	loggedNonBatchSnippetAt time.Time
 }
+
+// loggedNonBatchSnippetCooldown is how long an endpoint waits before logging
+// another body snippet. Operators want to see what changed (e.g. throttle
+// page → quota page) without log spam.
+const loggedNonBatchSnippetCooldown = 30 * time.Second
 
 // workersPerEndpoint is the number of concurrent poll goroutines spawned for
 // each configured script URL. Total workers = workersPerEndpoint × len(endpoints).
@@ -655,6 +667,13 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 			return len(frames) > 0
 		}
 		if isLikelyNonBatchRelayPayload(respBody) {
+			// On the healthy → non-batch transition, log a snippet of the
+			// actual response body so the operator can identify whether it's
+			// an Apps Script quota page, a Google interstitial, an
+			// "unauthorized" SSO redirect, or a misdeployed script. Without
+			// this, the only signal was "(likely HTML/JSON error page)" which
+			// gives the operator zero diagnostic data.
+			c.maybeLogRelayBodySnippet(endpointIdx, scriptURL, respBody)
 			c.markEndpointFailure(endpointIdx)
 			if attempt < maxAttempts {
 				log.Printf("[carrier] relay returned non-batch payload via %s (attempt %d/%d); retrying alternate script", shortScriptKey(scriptURL), attempt, maxAttempts)
@@ -1108,6 +1127,49 @@ func isLikelyNonBatchRelayPayload(body []byte) bool {
 		return true
 	}
 	return false
+}
+
+// maybeLogRelayBodySnippet logs the first ~200 chars of a non-batch
+// response body to help the operator identify what Apps Script is actually
+// returning (quota page vs SSO redirect vs dead deployment vs Google
+// interstitial). Rate-limited per endpoint to avoid log flooding under
+// sustained failure: at most one snippet per loggedNonBatchSnippetCooldown.
+//
+// Output is ASCII-clean (control chars stripped), so a binary blob doesn't
+// trash the operator's terminal.
+func (c *Client) maybeLogRelayBodySnippet(endpointIdx int, scriptURL string, body []byte) {
+	c.endpointMu.Lock()
+	if endpointIdx < 0 || endpointIdx >= len(c.endpoints) {
+		c.endpointMu.Unlock()
+		return
+	}
+	ep := &c.endpoints[endpointIdx]
+	now := time.Now()
+	if !ep.loggedNonBatchSnippetAt.IsZero() && now.Sub(ep.loggedNonBatchSnippetAt) < loggedNonBatchSnippetCooldown {
+		c.endpointMu.Unlock()
+		return
+	}
+	ep.loggedNonBatchSnippetAt = now
+	c.endpointMu.Unlock()
+
+	const maxLen = 200
+	t := bytes.TrimSpace(body)
+	if len(t) > maxLen {
+		t = t[:maxLen]
+	}
+	out := make([]byte, 0, len(t)+3)
+	for _, ch := range t {
+		if ch < 0x20 || ch == 0x7f {
+			out = append(out, ' ')
+			continue
+		}
+		out = append(out, ch)
+	}
+	if len(body) > maxLen {
+		out = append(out, '.', '.', '.')
+	}
+	log.Printf("[carrier] non-batch body via %s (%d bytes total): %s",
+		shortScriptKey(scriptURL), len(body), string(out))
 }
 
 func shortScriptKey(scriptURL string) string {
