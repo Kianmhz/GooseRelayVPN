@@ -169,6 +169,14 @@ func main() {
 	}
 	cancelDiag()
 
+	if cfg.MetricsAddr != "" {
+		if err := carr.StartLocalMetrics(ctx, cfg.MetricsAddr); err != nil {
+			log.Printf("[client] metrics listener could not start on %s: %v", cfg.MetricsAddr, err)
+		} else {
+			log.Printf("[client] /metrics enabled at http://%s/metrics", cfg.MetricsAddr)
+		}
+	}
+
 	go func() {
 		if err := carr.Run(ctx); err != nil && ctx.Err() == nil {
 			log.Fatalf("carrier run: %v", err)

@@ -24,6 +24,11 @@ type Client struct {
 	UseFronting bool
 	AESKeyHex   string // 64-char hex
 	DebugTiming bool   // when true, log per-session TTFB and per-poll Apps Script RTT
+
+	// MetricsAddr, if non-empty, starts a localhost-only HTTP listener
+	// serving /metrics in Prometheus text format. Recommended value:
+	// "127.0.0.1:9101". Off by default to avoid surprises on shared hosts.
+	MetricsAddr string
 }
 
 // clientFile is the user-friendly client config format.
@@ -56,6 +61,11 @@ type clientFile struct {
 	// Apps Script round-trip latency to help pinpoint where a slow connection
 	// is spending its time. Off by default.
 	DebugTiming bool `json:"debug_timing"`
+
+	// Optional Prometheus /metrics listener ("host:port"). Bind to localhost
+	// only — the metrics endpoint exposes session and traffic counters that
+	// should not be public. Empty disables the listener.
+	MetricsAddr string `json:"metrics_addr"`
 }
 
 func firstNonEmpty(values ...string) string {
@@ -286,6 +296,7 @@ func LoadClient(path string) (*Client, error) {
 		UseFronting: useFronting,
 		AESKeyHex:   key,
 		DebugTiming: f.DebugTiming,
+		MetricsAddr: strings.TrimSpace(f.MetricsAddr),
 	}
 	return &c, nil
 }

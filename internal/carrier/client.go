@@ -69,6 +69,14 @@ type relayEndpoint struct {
 	failCount       int
 	statsOK         uint64
 	statsFail       uint64
+
+	// ewmaRTT is the exponentially-weighted moving average of recent
+	// successful poll latencies. Used by power-of-two-choices endpoint
+	// selection so the fastest healthy endpoint receives more traffic
+	// without starving alternates entirely.
+	ewmaRTT     time.Duration
+	lastSuccess time.Time
+	firstFail   time.Time // when the most recent failure streak began
 }
 
 // workersPerEndpoint is the number of concurrent poll goroutines spawned for
@@ -77,27 +85,56 @@ type relayEndpoint struct {
 // parallelism rather than just spreading the same fixed pool thinner.
 const workersPerEndpoint = 3
 
+// ewmaRTTAlpha is the smoothing constant for the per-endpoint RTT EWMA.
+// 0.2 = recent samples are 20% of the new average; older samples decay over
+// ~5 polls. Aggressive enough to react to deployment-region quota churn
+// (Apps Script quotas reset on hourly windows) without being noisy.
+const ewmaRTTAlpha = 0.2
+
+// permanentDisableAfter is how long an endpoint can be in continuous failure
+// before we stop probing it entirely. Past this point we have very strong
+// evidence the deployment is dead/misconfigured and the per-failure backoff
+// already maxes out at endpointBlacklistMaxTTL anyway.
+const permanentDisableAfter = 24 * time.Hour
+
 // waker is a broadcast notifier: Broadcast() wakes all goroutines currently
 // blocked on C() simultaneously, unlike a buffered chan which only wakes one.
+//
+// Generation counter eliminates the subtle wake-race: a worker that calls
+// Generation() before pollOnce, then Broadcast() fires while the poll is
+// in-flight, must short-circuit the subsequent wait so the new event is not
+// lost. Without the counter, the previous design captured the wake channel
+// after the drain returned empty, allowing a Broadcast that fired during the
+// drain to be missed entirely — causing up to pollIdleSleep dead air on a
+// freshly-arriving SYN.
 type waker struct {
-	mu sync.Mutex
-	ch chan struct{}
+	mu  sync.Mutex
+	ch  chan struct{}
+	gen atomic.Uint64
 }
 
 func newWaker() *waker { return &waker{ch: make(chan struct{})} }
 
-// C returns the current channel to select on. Must be captured before
-// entering select so a concurrent Broadcast() cannot be missed.
-func (w *waker) C() <-chan struct{} {
+// snapshot captures the current channel and generation. Workers should call
+// this *before* draining work so that any Broadcast fired during the drain
+// bumps the generation and the subsequent wait can return immediately.
+func (w *waker) snapshot() (<-chan struct{}, uint64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.ch
+	return w.ch, w.gen.Load()
 }
 
-// Broadcast unblocks all goroutines currently waiting on C().
+// generation returns just the current generation counter without taking the
+// mutex. Used by waiters to detect whether a Broadcast happened since the
+// snapshot.
+func (w *waker) generation() uint64 { return w.gen.Load() }
+
+// Broadcast unblocks all goroutines currently waiting on the snapshot channel
+// and bumps the generation counter.
 func (w *waker) Broadcast() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.gen.Add(1)
 	close(w.ch)
 	w.ch = make(chan struct{})
 }
@@ -125,11 +162,17 @@ type Client struct {
 	endpoints    []relayEndpoint
 	nextEndpoint int
 
+	// drainCursor rotates the start of the txReady iteration order so no
+	// session is permanently starved when the batch cap is hit on every
+	// drain.
+	drainCursor uint64
+
 	idlePollMu       sync.Mutex
 	idlePollInFlight int
 
-	wake  *waker // broadcasts to all idle poll goroutines simultaneously
-	stats clientStats
+	wake    *waker // broadcasts to all idle poll goroutines simultaneously
+	stats   clientStats
+	pollRTT pollRTTHistogram
 }
 
 // clientStats holds atomic counters surfaced periodically by statsLoop.
@@ -187,21 +230,23 @@ func New(cfg Config) (*Client, error) {
 
 // NewSession creates a tunneled session for target ("host:port") and registers
 // it with the long-poll loop. Returns the session for the caller (typically
-// the SOCKS adapter) to wrap in a VirtualConn.
+// the SOCKS adapter) to wrap in a VirtualConn. Returns nil if crypto/rand
+// fails — the SOCKS adapter must check and refuse the connection cleanly
+// instead of crashing the process (a panic here would kill the whole
+// listener for what may be a transient resource exhaustion).
 func (c *Client) NewSession(target string) *session.Session {
 	var id [frame.SessionIDLen]byte
 	if _, err := rand.Read(id[:]); err != nil {
-		// crypto/rand failure is unrecoverable; panic so the process exits
-		// rather than emitting an all-zero ID.
-		panic(fmt.Errorf("crypto/rand: %w", err))
+		log.Printf("[carrier] crypto/rand failed for session id: %v — refusing connection", err)
+		return nil
 	}
 	s := session.New(id, target, true)
-	s.OnTx = func() {
+	s.SetOnTx(func() {
 		c.mu.Lock()
 		c.txReady[id] = struct{}{}
 		c.mu.Unlock()
 		c.kick()
-	}
+	})
 	c.mu.Lock()
 	c.sessions[id] = s
 	c.txReady[id] = struct{}{} // SYN is pending immediately on creation
@@ -292,13 +337,20 @@ func (c *Client) runWorker(ctx context.Context) {
 			return
 		default:
 		}
+		// Snapshot the waker BEFORE doing work. If Broadcast() fires while
+		// pollOnce/drainAll is in flight, the generation counter advances and
+		// the subsequent wait detects "work happened during my drain, skip
+		// sleeping" — closing the wake-channel race that previously caused
+		// up to pollIdleSleep (50 ms) of dead air on freshly-arriving SYN.
+		wakeCh, genBefore := c.wake.snapshot()
 		didWork := c.pollOnce(ctx)
 		c.gcDoneSessions()
 		if !didWork {
-			// Capture the wake channel before entering select so we cannot
-			// miss a Broadcast() that fires between drainAll() returning
-			// empty and us entering the wait.
-			wakeCh := c.wake.C()
+			if c.wake.generation() != genBefore {
+				// Broadcast fired during pollOnce — loop immediately so we
+				// don't sit on pollIdleSleep with new data already queued.
+				continue
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -381,11 +433,11 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 		req.Header.Set("Content-Type", "text/plain")
 		attempted = true
 
-		var pollStart time.Time
-		if c.debugTiming {
-			pollStart = time.Now()
-		}
+		pollStart := time.Now()
 		resp, err := c.pickHTTPClient().Do(req)
+		// Per-poll RTT is always captured (cost: 2 time.Now calls). Used by
+		// EWMA endpoint health → power-of-two-choices selection. Debug logs
+		// also surface it when DebugTiming is on.
 		if err != nil {
 			if ctx.Err() != nil {
 				return false
@@ -400,7 +452,12 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 			return false
 		}
 
-		respBody, readErr := io.ReadAll(resp.Body)
+		// LimitReader caps the response body so a misbehaving relay (HTML error
+		// page from a quota-exhausted Apps Script deployment, gateway timeouts,
+		// etc.) cannot OOM the carrier. The cap is the same value we already
+		// log-and-drop on (maxRelayResponseBodyBytes) — reading past that point
+		// is wasted work because we discard the result anyway.
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRelayResponseBodyBytes+1))
 		_ = resp.Body.Close()
 		if readErr != nil {
 			c.markEndpointFailure(endpointIdx)
@@ -413,7 +470,8 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 		}
 
 		if resp.StatusCode == http.StatusNoContent || len(respBody) == 0 {
-			c.markEndpointSuccess(endpointIdx)
+			c.markEndpointSuccessRTT(endpointIdx, time.Since(pollStart))
+			c.recordPollRTT(time.Since(pollStart))
 			pollOK = true
 			countFrameBytes(&c.stats.framesOut, &c.stats.bytesOut, frames)
 			return len(frames) > 0
@@ -460,13 +518,15 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 		for _, f := range rxFrames {
 			c.routeRx(f)
 		}
-		c.markEndpointSuccess(endpointIdx)
+		rtt := time.Since(pollStart)
+		c.markEndpointSuccessRTT(endpointIdx, rtt)
+		c.recordPollRTT(rtt)
 		pollOK = true
 		countFrameBytes(&c.stats.framesOut, &c.stats.bytesOut, frames)
 		countFrameBytes(&c.stats.framesIn, &c.stats.bytesIn, rxFrames)
 		if c.debugTiming {
 			log.Printf("[timing] poll rtt=%dms tx_frames=%d rx_frames=%d resp_bytes=%d via %s",
-				time.Since(pollStart).Milliseconds(), len(frames), len(rxFrames), len(respBody), shortScriptKey(scriptURL))
+				rtt.Milliseconds(), len(frames), len(rxFrames), len(respBody), shortScriptKey(scriptURL))
 		}
 		return len(frames) > 0 || len(rxFrames) > 0
 	}
@@ -508,29 +568,76 @@ func (c *Client) pickRelayEndpoint() (int, string) {
 		return -1, ""
 	}
 	now := time.Now()
-	start := c.nextEndpoint % n
-	for i := 0; i < n; i++ {
-		idx := (start + i) % n
-		ep := c.endpoints[idx]
-		if !ep.blacklistedTill.After(now) {
-			c.nextEndpoint = (idx + 1) % n
-			return idx, ep.url
-		}
-	}
 
-	chosen := 0
-	soonest := c.endpoints[0].blacklistedTill
-	for i := 1; i < n; i++ {
-		if c.endpoints[i].blacklistedTill.Before(soonest) {
-			chosen = i
-			soonest = c.endpoints[i].blacklistedTill
+	// Build the set of currently-eligible (non-blacklisted, not permanently
+	// disabled) endpoints. Power-of-two-choices then samples two of them and
+	// takes the lower-RTT one — a well-known load-balancing technique that
+	// closely approximates the optimal "pick the fastest" without the
+	// fairness pathologies of strict greedy selection (one endpoint hot,
+	// others cold). On ties or no RTT data we fall back to round-robin
+	// for backward-compatible behavior on first traffic.
+	eligible := make([]int, 0, n)
+	for i := 0; i < n; i++ {
+		ep := &c.endpoints[i]
+		if ep.blacklistedTill.After(now) {
+			continue
 		}
+		if !ep.firstFail.IsZero() && now.Sub(ep.firstFail) > permanentDisableAfter && ep.lastSuccess.Before(ep.firstFail) {
+			continue
+		}
+		eligible = append(eligible, i)
+	}
+	if len(eligible) == 0 {
+		// All endpoints blacklisted or permanently disabled — pick the one
+		// whose backoff expires soonest as a last resort.
+		chosen := 0
+		soonest := c.endpoints[0].blacklistedTill
+		for i := 1; i < n; i++ {
+			if c.endpoints[i].blacklistedTill.Before(soonest) {
+				chosen = i
+				soonest = c.endpoints[i].blacklistedTill
+			}
+		}
+		c.nextEndpoint = (chosen + 1) % n
+		return chosen, c.endpoints[chosen].url
+	}
+	if len(eligible) == 1 {
+		idx := eligible[0]
+		c.nextEndpoint = (idx + 1) % n
+		return idx, c.endpoints[idx].url
+	}
+	// Power-of-two-choices: random sample two distinct candidates and pick
+	// whichever has the lower EWMA RTT. If neither has been measured yet
+	// (cold start), fall back to round-robin so the very first polls fan out.
+	a := eligible[c.nextEndpoint%len(eligible)]
+	b := eligible[(c.nextEndpoint+1)%len(eligible)]
+	if a == b {
+		c.nextEndpoint = (a + 1) % n
+		return a, c.endpoints[a].url
+	}
+	rttA := c.endpoints[a].ewmaRTT
+	rttB := c.endpoints[b].ewmaRTT
+	var chosen int
+	switch {
+	case rttA == 0 && rttB == 0:
+		chosen = a // both cold; round-robin order picks 'a'
+	case rttA == 0:
+		chosen = a // give untested endpoints a chance to be measured
+	case rttB == 0:
+		chosen = b
+	case rttA <= rttB:
+		chosen = a
+	default:
+		chosen = b
 	}
 	c.nextEndpoint = (chosen + 1) % n
 	return chosen, c.endpoints[chosen].url
 }
 
-func (c *Client) markEndpointSuccess(endpointIdx int) {
+// markEndpointSuccessRTT records a success and updates the per-endpoint
+// EWMA RTT used by power-of-two-choices selection. rtt may be zero (e.g.
+// from a non-poll path) in which case only the success counters update.
+func (c *Client) markEndpointSuccessRTT(endpointIdx int, rtt time.Duration) {
 	c.endpointMu.Lock()
 	if endpointIdx < 0 || endpointIdx >= len(c.endpoints) {
 		c.endpointMu.Unlock()
@@ -539,9 +646,19 @@ func (c *Client) markEndpointSuccess(endpointIdx int) {
 	ep := &c.endpoints[endpointIdx]
 	wasFailing := ep.failCount > 0
 	ep.statsOK++
+	ep.lastSuccess = time.Now()
+	ep.firstFail = time.Time{}
 	url := ep.url
 	ep.failCount = 0
 	ep.blacklistedTill = time.Time{}
+	if rtt > 0 {
+		if ep.ewmaRTT == 0 {
+			ep.ewmaRTT = rtt
+		} else {
+			// EWMA: new = α*sample + (1-α)*old
+			ep.ewmaRTT = time.Duration(float64(rtt)*ewmaRTTAlpha + float64(ep.ewmaRTT)*(1.0-ewmaRTTAlpha))
+		}
+	}
 	c.endpointMu.Unlock()
 	if wasFailing {
 		log.Printf("[carrier] endpoint %s recovered (back in rotation)", shortScriptKey(url))
@@ -558,6 +675,9 @@ func (c *Client) markEndpointFailure(endpointIdx int) {
 	wasHealthy := ep.failCount == 0
 	ep.failCount++
 	ep.statsFail++
+	if ep.firstFail.IsZero() {
+		ep.firstFail = time.Now()
+	}
 	ttl := endpointBlacklistTTL(ep.failCount)
 	ep.blacklistedTill = time.Now().Add(ttl)
 	url := ep.url
@@ -634,14 +754,32 @@ func (c *Client) drainAll() ([]*frame.Frame, [][frame.SessionIDLen]byte) {
 		remaining -= len(frames)
 	}
 
+	// Snapshot keys + sort/rotate to ensure round-robin fairness across
+	// drains. Map iteration order in Go is randomised per range loop, which
+	// already provides some fairness, but does not give *progress* guarantees:
+	// a session that always lands at the back can be starved on every batch
+	// when the batch cap is hit. Cursor-based round-robin gives every session
+	// a fair shot at the front position.
+	ids := make([][frame.SessionIDLen]byte, 0, len(c.txReady))
+	for id := range c.txReady {
+		ids = append(ids, id)
+	}
+	if len(ids) > 0 && c.drainCursor < uint64(len(ids)) {
+		start := int(c.drainCursor % uint64(len(ids)))
+		if start > 0 {
+			ids = append(ids[start:], ids[:start]...)
+		}
+	}
+	c.drainCursor++
+
 	// First pass: SYN sessions only. New connections claim batch slots before
 	// ongoing data transfers so a large upload/download cannot push SYN frames
 	// out of the batch and delay connection setup by a full poll cycle.
-	for id := range c.txReady {
+	for _, id := range ids {
 		drain(id, true)
 	}
 	// Second pass: remaining data sessions.
-	for id := range c.txReady {
+	for _, id := range ids {
 		drain(id, false)
 	}
 	return out, drainedIDs
@@ -694,7 +832,19 @@ func (c *Client) routeRx(f *frame.Frame) {
 		c.stats.sessionsClose.Add(1)
 		return
 	}
-	s.ProcessRx(f)
+	if !s.ProcessRx(f) {
+		// Per-session inbox/queue exceeded its memory cap. Drop the session
+		// locally; the rxOverflow flag is set so subsequent frames are dropped
+		// silently. The SOCKS reader will see EOF on RxChan via the deliverRx
+		// path closing it.
+		log.Printf("[carrier] session %x rx-overflow, dropping locally", f.SessionID[:4])
+		s.Stop()
+		c.mu.Lock()
+		delete(c.sessions, f.SessionID)
+		delete(c.txReady, f.SessionID)
+		c.mu.Unlock()
+		c.stats.sessionsClose.Add(1)
+	}
 }
 
 func (c *Client) gcDoneSessions() {

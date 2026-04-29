@@ -20,7 +20,7 @@ func BenchmarkSessionEnqueueDrain_128KiB(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		s := New(benchSID(1), "example.com:443", true)
-		s.OnTx = func() {}
+		s.SetOnTx(func() {})
 		s.EnqueueTx(chunk)
 		_ = s.DrainTx(128 * 1024)
 	}
@@ -31,7 +31,7 @@ func BenchmarkSessionEnqueueDrain_1MiB(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		s := New(benchSID(2), "example.com:443", true)
-		s.OnTx = func() {}
+		s.SetOnTx(func() {})
 		s.EnqueueTx(chunk)
 		_ = s.DrainTx(128 * 1024)
 	}

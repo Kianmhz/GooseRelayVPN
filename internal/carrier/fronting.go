@@ -9,7 +9,11 @@ import (
 	"crypto/tls"
 	"net"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // FrontingConfig describes how to reach script.google.com without revealing
@@ -22,8 +26,12 @@ import (
 // with its own connection pool, which maps to a separate TLS SNI value and
 // therefore a separate per-domain throttle bucket on the Google CDN. Requests
 // are distributed across clients in round-robin order.
+//
+// GoogleIP may be a single "ip:port" or a comma-separated list of "ip:port"
+// values. With multiple IPs each dial round-robins across them so a single
+// brittle Google PoP can't bring the tunnel down.
 type FrontingConfig struct {
-	GoogleIP string   // "ip:443"
+	GoogleIP string   // "ip:443" or "ip1:443,ip2:443,ip3:443"
 	SNIHosts []string // e.g. ["www.google.com", "mail.google.com", "accounts.google.com"]
 }
 
@@ -39,34 +47,85 @@ func NewFrontedClients(cfg FrontingConfig, pollTimeout time.Duration) []*http.Cl
 	if len(hosts) == 0 {
 		hosts = []string{"www.google.com"}
 	}
+	googleIPs := splitGoogleIPs(cfg.GoogleIP)
 	clients := make([]*http.Client, len(hosts))
 	for i, sni := range hosts {
-		clients[i] = newFrontedClient(cfg.GoogleIP, sni, pollTimeout)
+		clients[i] = newFrontedClient(googleIPs, sni, pollTimeout)
 	}
 	return clients
 }
 
-// newFrontedClient builds a single *http.Client that dials googleIP and
-// presents sniHost in the TLS handshake.
-func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration) *http.Client {
+// splitGoogleIPs accepts either a single "ip:port" or a comma-separated list,
+// trims whitespace, and returns the parsed slice. An empty/whitespace input
+// returns nil so dialContext falls back to default DNS resolution.
+func splitGoogleIPs(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// newFrontedClient builds a single *http.Client that dials one of googleIPs
+// (round-robin) and presents sniHost in the TLS handshake.
+func newFrontedClient(googleIPs []string, sniHost string, pollTimeout time.Duration) *http.Client {
 	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 
+	var rrCounter atomic.Uint64
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if googleIP != "" {
-				return dialer.DialContext(ctx, "tcp", googleIP)
+			if len(googleIPs) == 0 {
+				return dialer.DialContext(ctx, network, addr)
 			}
-			return dialer.DialContext(ctx, network, addr)
+			// Round-robin across configured Google IPs so a single brittle
+			// edge node can't take the tunnel down. For one configured IP this
+			// reduces to the previous behavior.
+			idx := rrCounter.Add(1) - 1
+			ip := googleIPs[idx%uint64(len(googleIPs))]
+			conn, err := dialer.DialContext(ctx, "tcp", ip)
+			if err != nil && len(googleIPs) > 1 {
+				// Try the next IP exactly once; if the first attempt failed
+				// (TCP RST, host unreachable, slow handshake) we don't want
+				// to fail the whole poll while another known-good IP is
+				// available in the same client.
+				next := googleIPs[(idx+1)%uint64(len(googleIPs))]
+				if conn2, err2 := dialer.DialContext(ctx, "tcp", next); err2 == nil {
+					return conn2, nil
+				}
+			}
+			return conn, err
 		},
 		TLSClientConfig: &tls.Config{
 			ServerName: sniHost,
+			// Require TLS 1.3 to (a) eliminate TLS 1.2's 2-RTT handshake on
+			// cold pools and (b) get ChaCha20-Poly1305 negotiation when the
+			// CPU lacks AES-NI. All Google front-ends advertise 1.3.
+			MinVersion: tls.VersionTLS13,
 		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          16,
+		MaxIdleConnsPerHost:   workersPerEndpoint + 1, // ≥ workers/endpoint so cold-pool handshakes are rare
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		WriteBufferSize:       64 * 1024,
+		ReadBufferSize:        64 * 1024,
 	}
-
+	// Configure HTTP/2 so the long-lived h2 connection sends pings and detects
+	// black-holed peers quickly. Without ReadIdleTimeout, a dead h2 conn can
+	// linger until the kernel's TCP keepalive fires (~2 hours by default),
+	// leaking poll worker time as in-flight requests stall.
+	if h2t, err := http2.ConfigureTransports(transport); err == nil && h2t != nil {
+		h2t.ReadIdleTimeout = 30 * time.Second
+		h2t.PingTimeout = 15 * time.Second
+	}
 	return &http.Client{Transport: transport, Timeout: pollTimeout}
 }

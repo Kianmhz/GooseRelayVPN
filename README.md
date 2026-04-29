@@ -310,6 +310,95 @@ What the client does for you automatically:
 
 ---
 
+## Performance tuning
+
+The defaults are a good starting point for typical home / small-office use (a
+few simultaneous users, mixed traffic). Most operators do not need to change
+anything. The knobs below are for power users diagnosing or shaping
+performance.
+
+### Observability: `/metrics`
+
+Both binaries expose Prometheus-format metrics on demand:
+
+- **Server**: `/metrics` is served on the same port as `/tunnel`. Hit it with
+  `curl https://<vps>:8443/metrics`.
+- **Client**: set `metrics_addr` in `client_config.json` (e.g. `"127.0.0.1:9101"`)
+  to enable a localhost-only listener at `http://127.0.0.1:9101/metrics`.
+
+Useful series:
+
+- `goose_client_poll_rtt_ms{q="0.5|0.9|0.99"}` — poll RTT percentiles. The p99
+  is the user-visible "is the tunnel acting up" number.
+- `goose_client_endpoint_rtt_ms_ewma{endpoint="…"}` — per-endpoint EWMA RTT.
+  Used by power-of-two-choices selection; high values indicate a slow
+  deployment.
+- `goose_server_sessions_active`, `goose_client_sessions_active` — current
+  session counts; should stay roughly equal end-to-end.
+- `goose_server_dials_fail_total` — DNS or upstream connect failures. Sustained
+  growth means the VPS is having trouble reaching the open internet (DNS, IPv6
+  routing, ISP blocks, etc.).
+
+### Latency-aware endpoint selection
+
+When `script_keys` lists multiple Apps Script deployments, the client tracks an
+exponentially-weighted-moving-average RTT per endpoint and selects via
+power-of-two-choices: it samples two healthy endpoints and picks the lower-RTT
+one. This converges on the fastest deployment without starving the others
+(unlike a strict greedy selection). A persistently-failing endpoint is
+exponentially backed off and, after 24 hours of continuous failure, is taken
+out of the rotation entirely.
+
+You can confirm the algorithm is working by watching the
+`goose_client_endpoint_rtt_ms_ewma` series — the fastest endpoint should
+receive most of the traffic.
+
+### Multi-IP `google_host`
+
+The `google_host` field accepts a comma-separated list of Google edge IPs:
+
+```json
+"google_host": "216.239.38.120,142.250.190.120,172.217.16.142"
+```
+
+The client round-robins across them and falls back to the next IP on dial
+failure. Useful when one Google edge IP is being throttled or routed slowly
+from your ISP.
+
+### TLS/HTTP/2 tuning (built-in)
+
+The carrier pins **TLS 1.3 minimum** and configures HTTP/2 with a 30-second
+read-idle timeout and 15-second ping timeout, plus 64 KiB read/write buffers
+and `MaxIdleConnsPerHost = numPollWorkers + 1`. This eliminates a fresh TLS
+handshake on every cold-pool poll and detects dead connections quickly.
+
+### Server hardening
+
+The exit server caps every `/tunnel` request body at 50 MiB
+(`http.MaxBytesReader`), uses a 15 s `ReadHeaderTimeout` and 90 s
+`IdleTimeout`, and drains in-flight long-polls on `SIGTERM`/`SIGINT` via
+`http.Server.Shutdown(ctx)`. The systemd unit (`scripts/goose-relay.service`)
+adds `LimitNOFILE=65535`, `NoNewPrivileges=true`, `ProtectSystem=full`, and
+related sandbox flags. Reload with `systemctl daemon-reload && systemctl
+restart goose-relay` after redeploying.
+
+### Memory bounds
+
+Each session has an 8 MiB receive inbox cap and 256-frame queue cap. If the
+local SOCKS5 reader stalls (slow consumer), the inbox fills, the server emits
+a RST and the session is torn down — *only* that session, not the carrier as
+a whole. This eliminates the head-of-line blocking that an earlier
+channel-based design suffered from.
+
+### Benchmark harness
+
+`go test -bench=. -benchmem ./internal/bench` runs the carrier and exit
+server in-process over loopback with no Apps Script in the path. Use it to
+measure SOCKS5 setup, time-to-first-byte, and bulk throughput when iterating
+on tunnel internals.
+
+---
+
 ## Updating the Apps Script forwarder
 
 If you change `Code.gs` — for example to point at a new VPS IP — you must create a **new deployment** in the Apps Script editor (Deploy → **New deployment**, not just "Manage deployments"). Saving alone does nothing; the live `/exec` URL serves the published version. After redeploying, update `script_keys` in `client_config.json`.

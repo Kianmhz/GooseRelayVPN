@@ -9,6 +9,7 @@ package session
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kianmhz/GooseRelayVPN/internal/frame"
@@ -16,7 +17,20 @@ import (
 
 // TxBufHighWater is the soft ceiling on the per-session tx buffer; EnqueueTx
 // blocks once exceeded so a fast SOCKS5 writer can't cause unbounded growth.
+// Stop() / RequestClose() set closeReq + broadcast txCond so a blocked
+// EnqueueTx caller never deadlocks if the carrier dies.
 const TxBufHighWater = 8 * 1024 * 1024
+
+// rxInboxByteCap bounds the per-session inbox of *delivered-but-not-yet-decoded
+// frames* (bytes pending in rxLoop). When exceeded ProcessRx returns false so
+// the caller can RST the session instead of blocking the poll worker.
+const rxInboxByteCap = 8 * 1024 * 1024
+
+// rxQueueFrameCap bounds the per-session out-of-order reassembly queue. A
+// peer that sends ever-future Seq values without filling the gap would
+// otherwise grow this map unboundedly. When exceeded the session is
+// force-closed.
+const rxQueueFrameCap = 256
 
 // sessionFinalTimeout is the maximum time to wait for the peer's FIN after
 // we have sent ours. If the peer's FIN frame is lost (e.g. dropped poll
@@ -32,6 +46,7 @@ type Session struct {
 
 	mu      sync.Mutex
 	txCond  *sync.Cond
+	rxCond  *sync.Cond
 	txBuf   []byte
 	txSeq   uint64
 	rxSeq   uint64
@@ -43,16 +58,25 @@ type Session struct {
 	finSentAt time.Time // when finSent was set; used for orphan reaping
 	rxClosed  bool      // RxChan has been closed (peer FIN received)
 
+	// Per-session inbox of frames waiting for in-order reassembly + delivery.
+	// rxLoop is the sole consumer; ProcessRx is the producer. Memory-bounded
+	// by rxInboxBytes, never blocks ProcessRx — overflow returns false so the
+	// caller can RST the session rather than wedge the poll worker.
+	rxInbox        []*frame.Frame
+	rxInboxHead    int
+	rxInboxBytes   int
+	rxInboxStopped bool
+	rxOverflowed   atomic.Bool
+
 	RxChan chan []byte
 
-	// OnTx is invoked when EnqueueTx adds data and when closeReq transitions
+	// onTx is invoked when EnqueueTx adds data and when closeReq transitions
 	// true. The carrier sets it to wake its long-poll loop.
-	OnTx func()
+	//
+	// Stored as atomic.Pointer to remove the historical (subtle, unsynchronized)
+	// race between SetOnTx and concurrent EnqueueTx calls.
+	onTx atomic.Pointer[func()]
 
-	// rxInbox is the per-session inbox for incoming frames. rxLoop drains it
-	// so poll workers are never blocked by a slow SOCKS consumer on one session
-	// holding up frame delivery for all other sessions.
-	rxInbox  chan *frame.Frame
 	rxDone   chan struct{}
 	stopOnce sync.Once
 }
@@ -68,18 +92,58 @@ func New(id [frame.SessionIDLen]byte, target string, needsSYN bool) *Session {
 		rxQueue:   make(map[uint64]*frame.Frame),
 		RxChan:    make(chan []byte, 1024),
 		synNeeded: needsSYN,
-		rxInbox:   make(chan *frame.Frame, 64),
 		rxDone:    make(chan struct{}),
 	}
 	s.txCond = sync.NewCond(&s.mu)
+	s.rxCond = sync.NewCond(&s.mu)
 	go s.rxLoop()
 	return s
 }
 
-// Stop signals the rxLoop goroutine to exit. Must be called after removing the
-// session from the routing table so no new ProcessRx calls can arrive.
+// SetOnTx publishes the tx-wake callback. Safe to call from any goroutine
+// before or after the session is registered with the carrier.
+func (s *Session) SetOnTx(fn func()) {
+	if fn == nil {
+		s.onTx.Store(nil)
+		return
+	}
+	s.onTx.Store(&fn)
+}
+
+// OnTxFunc returns the registered callback, or nil if none.
+func (s *Session) OnTxFunc() func() {
+	p := s.onTx.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// Stop signals the rxLoop goroutine to exit and wakes any goroutine blocked
+// in EnqueueTx so it cannot deadlock if the carrier dies. Safe to call
+// multiple times.
 func (s *Session) Stop() {
 	s.stopOnce.Do(func() { close(s.rxDone) })
+	s.mu.Lock()
+	s.closeReq = true
+	s.rxInboxStopped = true
+	// Drop any queued frames — rxLoop is exiting.
+	for i := range s.rxInbox {
+		s.rxInbox[i] = nil
+	}
+	s.rxInbox = nil
+	s.rxInboxHead = 0
+	s.rxInboxBytes = 0
+	s.txCond.Broadcast()
+	s.rxCond.Broadcast()
+	s.mu.Unlock()
+}
+
+// RxOverflowed reports whether ProcessRx ever returned false because the
+// per-session rx inbox or out-of-order queue exceeded its memory bound. The
+// carrier uses this to send a single RST and remove the session.
+func (s *Session) RxOverflowed() bool {
+	return s.rxOverflowed.Load()
 }
 
 // rxLoop is a per-session goroutine that delivers frames from rxInbox to RxChan
@@ -98,12 +162,29 @@ func (s *Session) rxLoop() {
 		s.mu.Unlock()
 	}()
 	for {
-		select {
-		case f := <-s.rxInbox:
-			if s.deliverRx(f) {
-				return
-			}
-		case <-s.rxDone:
+		s.mu.Lock()
+		for len(s.rxInbox)-s.rxInboxHead == 0 && !s.rxInboxStopped && !s.rxClosed {
+			s.rxCond.Wait()
+		}
+		if s.rxInboxStopped || s.rxClosed {
+			s.mu.Unlock()
+			return
+		}
+		f := s.rxInbox[s.rxInboxHead]
+		s.rxInbox[s.rxInboxHead] = nil
+		s.rxInboxHead++
+		s.rxInboxBytes -= len(f.Payload)
+		// Compact the slice once the head has eaten >50% of the backing array
+		// so we don't hold an arbitrarily long allocation alive.
+		if s.rxInboxHead > 0 && s.rxInboxHead*2 > len(s.rxInbox) {
+			rem := s.rxInbox[s.rxInboxHead:]
+			ns := make([]*frame.Frame, len(rem))
+			copy(ns, rem)
+			s.rxInbox = ns
+			s.rxInboxHead = 0
+		}
+		s.mu.Unlock()
+		if s.deliverRx(f) {
 			return
 		}
 	}
@@ -111,6 +192,10 @@ func (s *Session) rxLoop() {
 
 // EnqueueTx appends bytes to the session's tx buffer. Blocks while the buffer
 // exceeds TxBufHighWater. Safe to call concurrently with DrainTx.
+//
+// Stop() / RequestClose() guarantee a blocked writer is woken and returns
+// without enqueueing further bytes — the previous design could deadlock if
+// the carrier's poll loop died with TxBufHighWater bytes queued.
 func (s *Session) EnqueueTx(data []byte) {
 	s.mu.Lock()
 	for len(s.txBuf) > TxBufHighWater && !s.closeReq {
@@ -121,9 +206,8 @@ func (s *Session) EnqueueTx(data []byte) {
 		return
 	}
 	s.txBuf = append(s.txBuf, data...)
-	cb := s.OnTx
 	s.mu.Unlock()
-	if cb != nil {
+	if cb := s.OnTxFunc(); cb != nil {
 		cb()
 	}
 }
@@ -134,9 +218,8 @@ func (s *Session) RequestClose() {
 	s.mu.Lock()
 	s.closeReq = true
 	s.txCond.Broadcast()
-	cb := s.OnTx
 	s.mu.Unlock()
-	if cb != nil {
+	if cb := s.OnTxFunc(); cb != nil {
 		cb()
 	}
 }
@@ -148,6 +231,7 @@ func (s *Session) CloseRx() {
 	if !s.rxClosed {
 		s.rxClosed = true
 		close(s.RxChan)
+		s.rxCond.Broadcast()
 	}
 }
 
@@ -297,23 +381,34 @@ func (s *Session) drainTx(maxPayload, maxFrames int) []*frame.Frame {
 	return frames
 }
 
-// ProcessRx enqueues f to the per-session rxLoop goroutine without blocking.
-// If rxInbox is saturated the downstream reader cannot keep up; the session is
-// killed so the poll worker is never stalled by a slow SOCKS consumer.
-func (s *Session) ProcessRx(f *frame.Frame) {
+// ProcessRx queues f for delivery. Returns true if the frame was accepted (or
+// silently dropped because the session is already closed) and false only when
+// the per-session rx inbox exceeded its memory bound — the caller must then
+// RST the session and remove it from its routing table.
+//
+// Never blocks: this is the change that makes one slow SOCKS reader unable to
+// stall poll workers handling unrelated sessions. The slice-backed inbox is
+// memory-bounded by total payload bytes (rxInboxByteCap), not by frame count,
+// so a stream of small frames cannot evade the cap.
+func (s *Session) ProcessRx(f *frame.Frame) bool {
+	payloadLen := len(f.Payload)
 	s.mu.Lock()
-	if s.rxClosed {
+	if s.rxClosed || s.rxInboxStopped {
 		s.mu.Unlock()
-		return
+		return true // dropped, but not an overflow signal
 	}
+	if s.rxInboxBytes+payloadLen > rxInboxByteCap {
+		s.rxInboxStopped = true
+		s.rxOverflowed.Store(true)
+		s.rxCond.Broadcast()
+		s.mu.Unlock()
+		return false
+	}
+	s.rxInbox = append(s.rxInbox, f)
+	s.rxInboxBytes += payloadLen
+	s.rxCond.Signal()
 	s.mu.Unlock()
-	select {
-	case s.rxInbox <- f:
-	case <-s.rxDone:
-	default:
-		// rxInbox full — kill the session rather than block the poll worker.
-		s.Stop()
-	}
+	return true
 }
 
 // deliverRx performs in-order reassembly and delivers payloads to RxChan.
@@ -330,6 +425,14 @@ func (s *Session) deliverRx(f *frame.Frame) bool {
 		return false
 	}
 	if f.Seq > s.rxSeq {
+		if len(s.rxQueue) >= rxQueueFrameCap {
+			// Out-of-order queue would grow unboundedly — drop the session.
+			s.rxOverflowed.Store(true)
+			s.rxClosed = true
+			close(s.RxChan)
+			s.mu.Unlock()
+			return true
+		}
 		s.rxQueue[f.Seq] = f
 		s.mu.Unlock()
 		return false

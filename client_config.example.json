@@ -8,5 +8,6 @@
     "REPLACE_WITH_DEPLOYMENT_ID",
     "OPTIONAL_SECOND_DEPLOYMENT_ID"
   ],
-  "tunnel_key": "REPLACE_WITH_OUTPUT_OF_scripts_gen-key.sh"
+  "tunnel_key": "REPLACE_WITH_OUTPUT_OF_scripts_gen-key.sh",
+  "metrics_addr": ""
 }

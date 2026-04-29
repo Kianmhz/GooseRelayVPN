@@ -29,7 +29,27 @@ func (c *Client) Diagnose(ctx context.Context) error {
 	if len(c.endpoints) == 0 {
 		return fmt.Errorf("no relay endpoints configured")
 	}
-	scriptURL := c.endpoints[0].url
+	// Probe every configured endpoint and return the first error verbatim
+	// only when ALL endpoints fail. Previously only endpoints[0] was checked,
+	// so a typo'd Deployment ID in the *second* slot would not be flagged
+	// until the first endpoint failed mid-session and we rotated to the
+	// broken one.
+	var lastErr error
+	for i := range c.endpoints {
+		scriptURL := c.endpoints[i].url
+		if err := c.diagnoseOne(ctx, scriptURL); err != nil {
+			lastErr = err
+			continue
+		}
+		// One healthy endpoint is enough to declare the tunnel working;
+		// other endpoints will be probed lazily on first use.
+		return nil
+	}
+	return lastErr
+}
+
+// diagnoseOne runs the two-probe sequence against a single endpoint URL.
+func (c *Client) diagnoseOne(ctx context.Context, scriptURL string) error {
 
 	// --- Probe 1: GET the deployment to confirm it is live and public. ---
 	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, scriptURL, nil)

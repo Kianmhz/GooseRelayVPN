@@ -1,6 +1,7 @@
 [Unit]
 Description=GooseRelayVPN exit server
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -10,6 +11,28 @@ Restart=always
 RestartSec=3
 StandardOutput=journal
 StandardError=journal
+
+# --- Resource limits ---
+# Each tunneled session holds at least one upstream TCP socket plus a few
+# in-flight HTTP request goroutines. The default 1024 file-descriptor cap
+# rate-limits us at ~500 concurrent sessions; raise to 65535 so a busy
+# user can hold hundreds of sessions plus headroom for transient bursts.
+LimitNOFILE=65535
+
+# --- Sandboxing ---
+# These flags shrink the blast radius of any RCE in the tunnel handler.
+# All values are well within what a network long-poll service needs.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
 
 [Install]
 WantedBy=multi-user.target

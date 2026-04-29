@@ -183,7 +183,7 @@ func TestEnqueueTx_BackpressureBlocksAndReleases(t *testing.T) {
 func TestOnTx_FiresOnEnqueue(t *testing.T) {
 	s := New(sid(7), "x:1", false)
 	notified := make(chan struct{}, 4)
-	s.OnTx = func() { notified <- struct{}{} }
+	s.SetOnTx(func() { notified <- struct{}{} })
 	s.EnqueueTx([]byte("hi"))
 	select {
 	case <-notified:

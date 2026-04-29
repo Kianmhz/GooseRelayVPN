@@ -11,6 +11,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -22,6 +24,30 @@ import (
 )
 
 const (
+	// maxRequestBodyBytes is the hard cap on /tunnel POST body size. Apps Script
+	// itself caps at ~50MB; this matches that with margin so a malicious or
+	// buggy client cannot OOM the server with a single request.
+	maxRequestBodyBytes = 50 * 1024 * 1024
+
+	// dialFailureGCInterval is how often the recordDialFailure GC sweeps
+	// expired entries so a long-running server with many distinct failed
+	// hostnames does not slowly leak memory.
+	dialFailureGCInterval = 60 * time.Second
+
+	// httpReadHeaderTimeout caps HTTP request *header* read time. Without
+	// this a slowloris attacker can hold connections open writing one byte
+	// every minute forever.
+	httpReadHeaderTimeout = 15 * time.Second
+
+	// httpIdleTimeout closes idle keepalive HTTP/1.1 connections. The
+	// long-poll relay only needs one in-flight request at a time per client;
+	// 90s is generous and matches Go's transport default.
+	httpIdleTimeout = 90 * time.Second
+
+	// gracefulShutdownTimeout bounds how long we wait for in-flight long-poll
+	// requests to drain on SIGTERM before forcing connection close.
+	gracefulShutdownTimeout = LongPollWindow + 5*time.Second
+
 	// ActiveDrainWindow caps how long a batch that just performed real work
 	// (SYN/connect or non-empty uplink data) waits for downstream bytes.
 	// Kept short so the client's single poll loop can quickly cycle back
@@ -115,6 +141,18 @@ type Server struct {
 
 	activity chan struct{} // buffered len 1; coalesces "session has new tx" signals
 	stats    serverStats
+
+	// httpSrv is captured so a SIGTERM/SIGINT handler can call Shutdown(ctx)
+	// for graceful drain instead of dropping all in-flight long-polls.
+	httpSrv *http.Server
+
+	// cancelBg cancels the StartBackground-launched maintenance goroutines.
+	cancelBg context.CancelFunc
+
+	// upstreamReadPool is a sync.Pool of 128KiB read buffers reused across
+	// upstream pump goroutines. Per-session goroutines previously allocated
+	// a fresh 128KiB buffer on every openSession; the pool eliminates that.
+	upstreamReadPool sync.Pool
 }
 
 // serverStats holds atomic counters surfaced periodically by runStatsLoop.
@@ -139,7 +177,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	dialFn := dialFunc(cfg.UpstreamProxy)
-	return &Server{
+	s := &Server{
 		cfg:          cfg,
 		aead:         aead,
 		dial:         dialFn,
@@ -152,7 +190,12 @@ func New(cfg Config) (*Server, error) {
 		lastActivity: make(map[[frame.SessionIDLen]byte]time.Time),
 		dialFail:     make(map[string]time.Time),
 		activity:     make(chan struct{}, 1),
-	}, nil
+	}
+	s.upstreamReadPool.New = func() interface{} {
+		buf := make([]byte, upstreamReadBuf)
+		return &buf
+	}
+	return s, nil
 }
 
 // dialFunc returns a dial function. When proxyAddr is non-empty it routes all
@@ -182,31 +225,102 @@ func dialFunc(proxyAddr string) func(network, address string, timeout time.Durat
 	}
 }
 
+// ServeTunnel exposes the /tunnel handler so callers (e.g. integration test
+// harnesses or alternative front-ends) can mount it on their own mux.
+func (s *Server) ServeTunnel(w http.ResponseWriter, r *http.Request) { s.handleTunnel(w, r) }
+
+// StartBackground starts the long-running maintenance goroutines (idle GC,
+// stats loop, dialFail GC). It is intended for embed-style use where the
+// caller drives an http.Server itself instead of calling ListenAndServe.
+// Safe to call once per Server.
+func (s *Server) StartBackground() {
+	bgCtx, cancel := context.WithCancel(context.Background())
+	s.cancelBg = cancel
+	go s.runStatsLoop(bgCtx)
+	go s.runIdleGCLoop(bgCtx)
+	go s.runDialFailGCLoop(bgCtx)
+}
+
 // ListenAndServe blocks. It binds an HTTP listener on cfg.ListenAddr with one
-// route, POST /tunnel, that handles batched encrypted frames.
+// route, POST /tunnel, that handles batched encrypted frames. Listens for
+// SIGINT/SIGTERM and triggers graceful shutdown so in-flight long-polls drain.
 func (s *Server) ListenAndServe() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tunnel", s.handleTunnel)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	metricsHandler := s.metricsHandler()
+	if metricsHandler != nil {
+		mux.Handle("/metrics", metricsHandler)
+	}
+
 	httpSrv := &http.Server{
-		Addr:        s.cfg.ListenAddr,
-		Handler:     mux,
-		ReadTimeout: 30 * time.Second,
+		Addr:              s.cfg.ListenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       30 * time.Second,
 		// WriteTimeout intentionally generous — long-poll responses can take
 		// up to LongPollWindow to start writing.
 		WriteTimeout: LongPollWindow + 10*time.Second,
+		IdleTimeout:  httpIdleTimeout,
 	}
+	s.httpSrv = httpSrv
 
 	// Background loops that share the lifetime of the HTTP server.
 	bgCtx, cancelBg := context.WithCancel(context.Background())
 	defer cancelBg()
 	go s.runStatsLoop(bgCtx)
 	go s.runIdleGCLoop(bgCtx)
+	go s.runDialFailGCLoop(bgCtx)
+
+	// Graceful shutdown on SIGINT / SIGTERM.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig, ok := <-sigCh
+		if !ok {
+			return
+		}
+		log.Printf("[exit] received %s — beginning graceful shutdown (≤%s for in-flight long-polls)", sig, gracefulShutdownTimeout)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[exit] graceful shutdown error: %v", err)
+		}
+		cancelBg()
+	}()
 
 	log.Printf("[exit] listening on %s", s.cfg.ListenAddr)
-	return httpSrv.ListenAndServe()
+	err := httpSrv.ListenAndServe()
+	signal.Stop(sigCh)
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
+}
+
+// runDialFailGCLoop sweeps expired dialFail entries periodically. Without
+// this the map grows indefinitely on long-running servers that see many
+// distinct failed hostnames (typo'd targets, blocked-by-region domains, etc).
+func (s *Server) runDialFailGCLoop(ctx context.Context) {
+	t := time.NewTicker(dialFailureGCInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			now := time.Now()
+			s.mu.Lock()
+			for target, until := range s.dialFail {
+				if now.After(until) {
+					delete(s.dialFail, target)
+				}
+			}
+			s.mu.Unlock()
+		}
+	}
 }
 
 func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
@@ -215,7 +329,11 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.stats.requests.Add(1)
-	body, err := io.ReadAll(r.Body)
+	// MaxBytesReader caps body reads — without this a misbehaving (or
+	// malicious) client could OOM the process with a 10 GiB POST.
+	limited := http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	defer limited.Close()
+	body, err := io.ReadAll(limited)
 	if err != nil {
 		log.Printf("[exit] read body: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
@@ -251,13 +369,27 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	for {
 		txFrames, urgent := s.drainAll()
 		if len(txFrames) > 0 {
+			// Skip coalesce when the batch is already saturated (frames at the
+			// per-batch cap or aggregate payload is large enough that another
+			// 25 ms only adds latency without meaningfully more bulk).
+			batchCap := maxDrainFramesPerBatch
+			s.mu.Lock()
+			if len(s.sessions) >= busySessionThreshold {
+				batchCap = maxDrainFramesPerBatchBusy
+			}
+			s.mu.Unlock()
+			var totalBytes int
+			for _, f := range txFrames {
+				totalBytes += len(f.Payload)
+			}
+			saturated := len(txFrames) >= batchCap || totalBytes >= 1024*1024
 			// Coalesce bursts into one response to reduce per-request overhead,
 			// but only when the batch is large enough to be bulk/video traffic.
 			// Small batches (≤ coalesceMinFrames) are interactive; adding a
 			// 25ms wait there compounds latency across every TLS round-trip.
 			// Urgent batches (RSTs, first downstream after SYN) skip coalesce
 			// unconditionally so connection setup is not delayed.
-			if !urgent && len(txFrames) > coalesceMinFrames {
+			if !urgent && !saturated && len(txFrames) > coalesceMinFrames {
 				coalesceDeadline := time.Now().Add(coalesceWindow)
 			coalesceLoop:
 				for {
@@ -322,6 +454,23 @@ func (s *Server) drainWindow(rxFrames []*frame.Frame) time.Duration {
 	return LongPollWindow
 }
 
+// queuePendingRST appends an RST for sid only if one is not already queued.
+// Without dedup, a client running with stale session state would generate one
+// RST per stray frame, all targeting the same dead session — pure bloat.
+func (s *Server) queuePendingRST(sid [frame.SessionIDLen]byte) {
+	s.mu.Lock()
+	for _, r := range s.pendingRSTs {
+		if r.SessionID == sid {
+			s.mu.Unlock()
+			return
+		}
+	}
+	s.pendingRSTs = append(s.pendingRSTs, &frame.Frame{SessionID: sid, Flags: frame.FlagRST})
+	s.mu.Unlock()
+	s.stats.rstSent.Add(1)
+	s.kick()
+}
+
 // routeIncoming routes one incoming frame to its session, creating the session
 // (and dialing upstream) if this is a SYN.
 func (s *Server) routeIncoming(f *frame.Frame) {
@@ -332,21 +481,11 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 	if !exists {
 		if !f.HasFlag(frame.FlagSYN) {
 			log.Printf("[exit] frame for unknown session (no SYN), sending RST")
-			rst := &frame.Frame{SessionID: f.SessionID, Flags: frame.FlagRST}
-			s.mu.Lock()
-			s.pendingRSTs = append(s.pendingRSTs, rst)
-			s.mu.Unlock()
-			s.stats.rstSent.Add(1)
-			s.kick()
+			s.queuePendingRST(f.SessionID)
 			return
 		}
 		if s.isDialSuppressed(f.Target) {
-			rst := &frame.Frame{SessionID: f.SessionID, Flags: frame.FlagRST}
-			s.mu.Lock()
-			s.pendingRSTs = append(s.pendingRSTs, rst)
-			s.mu.Unlock()
-			s.stats.rstSent.Add(1)
-			s.kick()
+			s.queuePendingRST(f.SessionID)
 			return
 		}
 		var err error
@@ -360,7 +499,14 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 		s.stats.dialsOK.Add(1)
 		s.clearDialFailure(f.Target)
 	}
-	sess.ProcessRx(f)
+	if !sess.ProcessRx(f) {
+		// Per-session inbox/queue exceeded its memory cap. Force-close so we
+		// don't keep adding frames the slow consumer can't drain.
+		log.Printf("[exit] session %x rx-overflow, RST'ing", f.SessionID[:4])
+		s.tearDownSession(f.SessionID)
+		s.queuePendingRST(f.SessionID)
+		return
+	}
 	// Touch activity AFTER ProcessRx so a successful client→server frame
 	// resets the idle timer for this session.
 	s.mu.Lock()
@@ -368,6 +514,27 @@ func (s *Server) routeIncoming(f *frame.Frame) {
 		s.lastActivity[f.SessionID] = time.Now()
 	}
 	s.mu.Unlock()
+}
+
+// tearDownSession force-closes the session for sid (used on rx-overflow RST).
+func (s *Server) tearDownSession(sid [frame.SessionIDLen]byte) {
+	s.mu.Lock()
+	sess := s.sessions[sid]
+	upstream := s.upstreams[sid]
+	delete(s.sessions, sid)
+	delete(s.txReady, sid)
+	delete(s.firstReply, sid)
+	delete(s.upstreams, sid)
+	delete(s.lastActivity, sid)
+	s.mu.Unlock()
+	if upstream != nil {
+		_ = upstream.Close()
+	}
+	if sess != nil {
+		sess.CloseRx()
+		sess.Stop()
+	}
+	s.stats.sessionsClose.Add(1)
 }
 
 // openSession dials the upstream target, creates a Session for the given ID,
@@ -408,12 +575,12 @@ func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*sessi
 	}
 	dialedAt := time.Now()
 	sess := session.New(id, target, false)
-	sess.OnTx = func() {
+	sess.SetOnTx(func() {
 		s.mu.Lock()
 		s.txReady[id] = struct{}{}
 		s.mu.Unlock()
 		s.kick()
-	}
+	})
 
 	s.mu.Lock()
 	s.sessions[id] = sess
@@ -428,7 +595,14 @@ func (s *Server) openSession(id [frame.SessionIDLen]byte, target string) (*sessi
 	// Upstream → session.EnqueueTx (downstream direction).
 	go func() {
 		defer upstream.Close()
-		buf := make([]byte, upstreamReadBuf)
+		bufP := s.upstreamReadPool.Get().(*[]byte)
+		buf := *bufP
+		defer func() {
+			// Zero the pointer so we don't accidentally hold a reference;
+			// the pool returns the slice header so future Reads get a fresh
+			// 128KiB buffer view but back the same allocation.
+			s.upstreamReadPool.Put(bufP)
+		}()
 		firstRead := true
 		for {
 			n, err := upstream.Read(buf)
