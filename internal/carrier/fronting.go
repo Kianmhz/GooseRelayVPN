@@ -74,6 +74,16 @@ func splitGoogleIPs(raw string) []string {
 	return out
 }
 
+// tlsSessionCache is a process-global LRU cache of TLS 1.3 session tickets.
+// Without an explicit ClientSessionCache, Go's tls package re-handshakes from
+// scratch on every cold connection — which is every time MaxIdleConnsPerHost
+// rotates a stale conn or the GFE rotates us to a new edge IP that still
+// happens to issue a resumable ticket. With this cache, resumed handshakes
+// are 1-RTT (vs 2-RTT for full TLS 1.3), saving ~1 RTT to Google on every
+// cold reconnect. Sized at 64 entries so we cache tickets across all
+// configured google_host IPs and SNI variations comfortably.
+var tlsSessionCache = tls.NewLRUClientSessionCache(64)
+
 // newFrontedClient builds a single *http.Client that dials one of googleIPs
 // (round-robin) and presents sniHost in the TLS handshake.
 func newFrontedClient(googleIPs []string, sniHost string, pollTimeout time.Duration) *http.Client {
@@ -109,6 +119,10 @@ func newFrontedClient(googleIPs []string, sniHost string, pollTimeout time.Durat
 			// cold pools and (b) get ChaCha20-Poly1305 negotiation when the
 			// CPU lacks AES-NI. All Google front-ends advertise 1.3.
 			MinVersion: tls.VersionTLS13,
+			// Reuse session tickets across cold reconnects so resumed
+			// handshakes are 1-RTT instead of 2-RTT. Cache is process-global
+			// and shared across all per-SNI clients.
+			ClientSessionCache: tlsSessionCache,
 		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          16,
@@ -126,6 +140,14 @@ func newFrontedClient(googleIPs []string, sniHost string, pollTimeout time.Durat
 	if h2t, err := http2.ConfigureTransports(transport); err == nil && h2t != nil {
 		h2t.ReadIdleTimeout = 30 * time.Second
 		h2t.PingTimeout = 15 * time.Second
+		// Raise the max DATA frame size we are willing to receive from 16 KiB
+		// (spec default) to 1 MiB. Each DATA frame carries a 9-byte header,
+		// so on a long bulk download (Apps Script gateway streaming a video
+		// chunk back) the framing overhead drops by ~64× and the receiver
+		// makes ~64× fewer Read syscalls per MiB. Stream/conn flow control
+		// windows in golang.org/x/net/http2 already default to 4 MiB / 1 GiB,
+		// so the actual throughput cap is RTT-bound, not window-bound.
+		h2t.MaxReadFrameSize = 1 << 20
 	}
 	return &http.Client{Transport: transport, Timeout: pollTimeout}
 }

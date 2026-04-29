@@ -28,6 +28,20 @@ const (
 	// to avoid busy-looping if the server returns instantly with empty bodies.
 	pollIdleSleep = 50 * time.Millisecond
 
+	// pollIdleSleepHot is the abbreviated breather used when activity was
+	// observed within pollHotWindow. While hot, downstream data is likely to
+	// arrive any moment, so we want to spend more time inside long-polls and
+	// less time in the gap between them. 5 ms is short enough to be invisible
+	// to interactive users yet large enough that an idle worker does not
+	// busy-spin against the kernel scheduler.
+	pollIdleSleepHot = 5 * time.Millisecond
+
+	// pollHotWindow is how long after the last activity event we keep using
+	// the abbreviated sleep. 500 ms covers typical interactive bursts (TLS
+	// handshakes, REST request/reply pairs) without keeping a fully-idle
+	// tunnel hot indefinitely.
+	pollHotWindow = 500 * time.Millisecond
+
 	// pollTimeout is the per-request HTTP ceiling; should comfortably exceed
 	// the server's long-poll window (~25s).
 	pollTimeout = 120 * time.Second
@@ -173,6 +187,13 @@ type Client struct {
 	wake    *waker // broadcasts to all idle poll goroutines simultaneously
 	stats   clientStats
 	pollRTT pollRTTHistogram
+
+	// lastActivityNanos is the UnixNano timestamp of the most recent event
+	// that suggests downstream data may be on the way: a session creation,
+	// a TX frame queued by an upstream caller, or a non-empty poll response.
+	// runWorker reads it to decide whether to use the long pollIdleSleep
+	// (cold) or a much shorter wakeup interval (hot) between polls.
+	lastActivityNanos atomic.Int64
 }
 
 // clientStats holds atomic counters surfaced periodically by statsLoop.
@@ -245,6 +266,7 @@ func (c *Client) NewSession(target string) *session.Session {
 		c.mu.Lock()
 		c.txReady[id] = struct{}{}
 		c.mu.Unlock()
+		c.markActivity()
 		c.kick()
 	})
 	c.mu.Lock()
@@ -255,8 +277,19 @@ func (c *Client) NewSession(target string) *session.Session {
 	if c.debugTiming {
 		c.debugStarts.Store(id, time.Now())
 	}
+	c.markActivity()
 	c.kick()
 	return s
+}
+
+// markActivity records that something happened that suggests we should
+// stay hot for a short while: a new session was opened, a TX frame was
+// queued by an upstream goroutine, or a poll just returned non-empty.
+// Reads in runWorker are unsynchronized vs writes here — a slightly stale
+// read just biases the next sleep one way or the other; correctness is
+// not affected.
+func (c *Client) markActivity() {
+	c.lastActivityNanos.Store(time.Now().UnixNano())
 }
 
 // Shutdown sends an RST frame for every active session so the server can
@@ -307,11 +340,60 @@ func (c *Client) Shutdown(ctx context.Context) {
 	_ = resp.Body.Close()
 }
 
+// prewarmEndpoints fires one short-deadline HEAD per endpoint in parallel so
+// the TCP+TLS+HTTP/2 stack to each Google PoP is warm before the first
+// user-visible poll. Without this, the very first SOCKS connection after
+// `goose-client` boot pays the full cold-handshake cost (~150 ms RTT over a
+// residential connection to the nearest GFE), which the user feels as a
+// sluggish first click.
+//
+// HEAD is critical here: a POST with an empty body would be treated by the
+// exit server as a normal idle poll and held for LongPollWindow seconds,
+// during which the prewarm goroutine could win a race with a real poll
+// worker for downstream data drained from a session — and then discard it.
+// The exit server short-circuits non-POST methods to 405 (and Apps Script
+// has no doHead handler so it falls through similarly), so HEAD returns
+// immediately while still leaving a hot conn in the keep-alive pool.
+//
+// Best-effort: failures are logged but not surfaced. The warmup goroutine
+// also exits cleanly if ctx is canceled before the dials complete.
+func (c *Client) prewarmEndpoints(ctx context.Context) {
+	c.endpointMu.Lock()
+	urls := make([]string, len(c.endpoints))
+	for i, e := range c.endpoints {
+		urls[i] = e.url
+	}
+	c.endpointMu.Unlock()
+	for _, scriptURL := range urls {
+		go func(u string) {
+			pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(pctx, http.MethodHead, u, nil)
+			if err != nil {
+				return
+			}
+			resp, err := c.pickHTTPClient().Do(req)
+			if err != nil {
+				if c.debugTiming {
+					log.Printf("[carrier] prewarm %s failed: %v", shortScriptKey(u), err)
+				}
+				return
+			}
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4*1024))
+			_ = resp.Body.Close()
+			if c.debugTiming {
+				log.Printf("[carrier] prewarm %s status=%d", shortScriptKey(u), resp.StatusCode)
+			}
+		}(scriptURL)
+	}
+}
+
 // Run spawns c.numWorkers concurrent poll goroutines and blocks until ctx is
 // canceled. Worker count scales with the number of configured endpoints so that
 // adding more script URLs increases parallelism rather than spreading the same
 // fixed pool thinner.
 func (c *Client) Run(ctx context.Context) error {
+	c.prewarmEndpoints(ctx)
 	var wg sync.WaitGroup
 	for i := 0; i < c.numWorkers; i++ {
 		wg.Add(1)
@@ -351,12 +433,21 @@ func (c *Client) runWorker(ctx context.Context) {
 				// don't sit on pollIdleSleep with new data already queued.
 				continue
 			}
+			sleep := pollIdleSleep
+			if last := c.lastActivityNanos.Load(); last != 0 &&
+				time.Since(time.Unix(0, last)) < pollHotWindow {
+				// Recent activity: cycle back into the long-poll quickly so a
+				// downstream byte cannot be stranded for a full 50 ms in the
+				// gap between polls. The wake-channel still short-circuits
+				// this when an OnTx callback fires.
+				sleep = pollIdleSleepHot
+			}
 			select {
 			case <-ctx.Done():
 				return
 			case <-wakeCh:
 				// woken by new session data
-			case <-time.After(pollIdleSleep):
+			case <-time.After(sleep):
 			}
 		}
 	}
@@ -528,7 +619,11 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 			log.Printf("[timing] poll rtt=%dms tx_frames=%d rx_frames=%d resp_bytes=%d via %s",
 				rtt.Milliseconds(), len(frames), len(rxFrames), len(respBody), shortScriptKey(scriptURL))
 		}
-		return len(frames) > 0 || len(rxFrames) > 0
+		didWork := len(frames) > 0 || len(rxFrames) > 0
+		if didWork {
+			c.markActivity()
+		}
+		return didWork
 	}
 
 	return false

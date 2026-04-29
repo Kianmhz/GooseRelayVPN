@@ -23,10 +23,11 @@ type SessionFactory func(target string) *session.Session
 // a VirtualConn over a fresh tunneled session. The DNS resolver is overridden
 // with a no-op to prevent local DNS leaks (clients must use socks5h://).
 //
-// Wraps the listener with a TCP_NODELAY-applying acceptor so the kernel
-// doesn't introduce 40 ms Nagle delays on small SOCKS payloads (HTTP request
-// lines, TLS handshake records). The exit side already does this for upstream
-// connections; mirroring on the local side closes the loop.
+// Wraps the listener with a TCP_NODELAY + TCP_QUICKACK applying acceptor so
+// the kernel doesn't introduce 40 ms Nagle delays on small SOCKS payloads
+// (HTTP request lines, TLS handshake records) and doesn't hold back ACKs for
+// up to 40 ms on small request/reply pairs. The exit side already disables
+// Nagle for upstream connections; mirroring on the local side closes the loop.
 //
 // Blocks until ListenAndServe returns. Caller passes ctx for shutdown
 // signaling (the underlying go-socks5 library doesn't take a ctx, so this
@@ -61,9 +62,12 @@ func ServeListener(_ context.Context, ln net.Listener, factory SessionFactory) e
 	return server.Serve(&noDelayListener{Listener: ln})
 }
 
-// noDelayListener wraps net.Listener so each accepted *net.TCPConn has
-// SetNoDelay(true) applied. This eliminates kernel Nagle 40ms delays on small
-// SOCKS payloads (HTTP request line, TLS handshake records).
+// noDelayListener wraps net.Listener so each accepted *net.TCPConn has both
+// SetNoDelay(true) and (on Linux) TCP_QUICKACK applied. This eliminates the
+// kernel's 40 ms Nagle delay on small SOCKS write payloads and the 40 ms
+// delayed-ACK on small read replies — together they cover both directions
+// of every interactive request/reply pair (DNS-over-HTTPS, REST GETs, TLS
+// handshake records).
 type noDelayListener struct {
 	net.Listener
 }
@@ -76,6 +80,7 @@ func (l *noDelayListener) Accept() (net.Conn, error) {
 	if tcp, ok := c.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 	}
+	setQuickAck(c)
 	return c, nil
 }
 
