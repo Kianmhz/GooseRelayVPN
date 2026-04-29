@@ -83,11 +83,14 @@ You need two separate programs:
    - macOS (M1/M2/M3): `GooseRelayVPN-client-vX.Y.Z-darwin-arm64.tar.gz`
    - Linux: `GooseRelayVPN-client-vX.Y.Z-linux-amd64.tar.gz`
    - Android / Termux (arm64): `GooseRelayVPN-client-vX.Y.Z-android-arm64.tar.gz`
-3. For the **server**, SSH into your VPS and download the Linux binary directly:
-   ```bash
-   wget https://github.com/kianmhz/GooseRelayVPN/releases/latest/download/GooseRelayVPN-server-vX.Y.Z-linux-amd64.tar.gz
-   tar -xzf GooseRelayVPN-server-vX.Y.Z-linux-amd64.tar.gz
-   ```
+3. For the **server**, SSH into your VPS and download the binary for your server OS:
+   - **Linux (most common):**
+     ```bash
+     wget https://github.com/kianmhz/GooseRelayVPN/releases/latest/download/GooseRelayVPN-server-vX.Y.Z-linux-amd64.tar.gz
+     tar -xzf GooseRelayVPN-server-vX.Y.Z-linux-amd64.tar.gz
+     ```
+   - **Windows Server:** download `GooseRelayVPN-server-vX.Y.Z-windows-amd64.zip` from the Releases page and extract it to a folder such as `C:\goose-relay\`. See Step 8 (Windows) below for service setup.
+
    (Replace `vX.Y.Z` with the latest version number from the Releases page.)
 
 **Option B — Build from source (Go 1.22+):**
@@ -224,6 +227,39 @@ sudo systemctl daemon-reload
 sudo systemctl enable goose-relay
 sudo systemctl start goose-relay
 sudo systemctl status goose-relay --no-pager
+```
+
+### Step 8 (Windows): Keep the server running after reboot (NSSM)
+
+If your VPS runs **Windows Server**, use [NSSM](https://nssm.cc) (Non-Sucking Service Manager) to register `goose-server` as a Windows service instead of systemd. The `goose-server.exe` binary is a plain Go binary — no installer needed.
+
+**1. Open port 8443 in Windows Firewall** (run as Administrator in Command Prompt):
+```cmd
+netsh advfirewall firewall add rule name="GooseRelayVPN" protocol=TCP dir=in localport=8443 action=allow
+```
+Also add an inbound TCP/8443 rule in your cloud provider's firewall panel (Security Groups / Firewall Rules).
+
+**2. Download NSSM** from https://nssm.cc/download, extract it, and note the path to `nssm.exe` (e.g. `C:\nssm\win64\nssm.exe`).
+
+**3. Register and start the service** (run as Administrator):
+```cmd
+C:\nssm\win64\nssm.exe install GooseRelayVPN "C:\goose-relay\goose-server.exe"
+C:\nssm\win64\nssm.exe set GooseRelayVPN AppParameters "-config C:\goose-relay\server_config.json"
+C:\nssm\win64\nssm.exe set GooseRelayVPN AppDirectory "C:\goose-relay"
+C:\nssm\win64\nssm.exe set GooseRelayVPN Start SERVICE_AUTO_START
+C:\nssm\win64\nssm.exe start GooseRelayVPN
+```
+
+**4. Verify it is running:**
+```cmd
+C:\nssm\win64\nssm.exe status GooseRelayVPN
+curl http://YOUR.VPS.IP:8443/healthz
+```
+
+To stop or uninstall later:
+```cmd
+C:\nssm\win64\nssm.exe stop GooseRelayVPN
+C:\nssm\win64\nssm.exe remove GooseRelayVPN confirm
 ```
 
 ### Step 9: Run the client on your computer

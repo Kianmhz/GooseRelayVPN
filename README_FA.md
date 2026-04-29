@@ -83,11 +83,14 @@ Browser/App
    - macOS (M1/M2/M3): `GooseRelayVPN-client-vX.Y.Z-darwin-arm64.tar.gz`
    - Linux: `GooseRelayVPN-client-vX.Y.Z-linux-amd64.tar.gz`
    - Android / Termux (arm64): `GooseRelayVPN-client-vX.Y.Z-android-arm64.tar.gz`
-3. برای **سرور**، به VPS خود SSH بزنید و باینری لینوکس را مستقیم دانلود کنید:
-   ```bash
-   wget https://github.com/kianmhz/GooseRelayVPN/releases/latest/download/GooseRelayVPN-server-vX.Y.Z-linux-amd64.tar.gz
-   tar -xzf GooseRelayVPN-server-vX.Y.Z-linux-amd64.tar.gz
-   ```
+3. برای **سرور**، باینری مناسب سیستم‌عامل VPS خود را دانلود کنید:
+   - **لینوکس (رایج‌ترین):**
+     ```bash
+     wget https://github.com/kianmhz/GooseRelayVPN/releases/latest/download/GooseRelayVPN-server-vX.Y.Z-linux-amd64.tar.gz
+     tar -xzf GooseRelayVPN-server-vX.Y.Z-linux-amd64.tar.gz
+     ```
+   - **ویندوز سرور:** فایل `GooseRelayVPN-server-vX.Y.Z-windows-amd64.zip` را از صفحه Releases دانلود کنید و آن را در پوشه‌ای مثل `C:\goose-relay\` اکسترکت کنید. برای راه‌اندازی سرویس، مرحله ۸ (ویندوز) را ببینید.
+
    (عدد `vX.Y.Z` را با آخرین نسخه در صفحه Releases جایگزین کنید.)
 
 **گزینه B — ساخت از سورس (Go 1.22+):**
@@ -224,6 +227,39 @@ sudo systemctl daemon-reload
 sudo systemctl enable goose-relay
 sudo systemctl start goose-relay
 sudo systemctl status goose-relay --no-pager
+```
+
+### مرحله ۸ (ویندوز): اجرای خودکار سرور بعد از ریبوت (NSSM)
+
+اگر VPS شما **ویندوز سرور** دارد، به جای systemd از [NSSM](https://nssm.cc) (Non-Sucking Service Manager) استفاده کنید تا `goose-server` را به عنوان یک سرویس ویندوز ثبت کنید. فایل `goose-server.exe` یک باینری ساده Go است و نیازی به نصب ندارد.
+
+**۱. باز کردن پورت ۸۴۴۳ در فایروال ویندوز** (با دسترسی Administrator در Command Prompt):
+```cmd
+netsh advfirewall firewall add rule name="GooseRelayVPN" protocol=TCP dir=in localport=8443 action=allow
+```
+همچنین یک قانون ورودی TCP/8443 در پنل فایروال ارائه‌دهنده ابری خود اضافه کنید (Security Groups / Firewall Rules).
+
+**۲. دانلود NSSM** از آدرس https://nssm.cc/download، آن را اکسترکت کنید و مسیر `nssm.exe` را یادداشت کنید (مثلاً `C:\nssm\win64\nssm.exe`).
+
+**۳. ثبت و شروع سرویس** (با دسترسی Administrator):
+```cmd
+C:\nssm\win64\nssm.exe install GooseRelayVPN "C:\goose-relay\goose-server.exe"
+C:\nssm\win64\nssm.exe set GooseRelayVPN AppParameters "-config C:\goose-relay\server_config.json"
+C:\nssm\win64\nssm.exe set GooseRelayVPN AppDirectory "C:\goose-relay"
+C:\nssm\win64\nssm.exe set GooseRelayVPN Start SERVICE_AUTO_START
+C:\nssm\win64\nssm.exe start GooseRelayVPN
+```
+
+**۴. بررسی اجرا بودن سرویس:**
+```cmd
+C:\nssm\win64\nssm.exe status GooseRelayVPN
+curl http://YOUR.VPS.IP:8443/healthz
+```
+
+برای توقف یا حذف سرویس:
+```cmd
+C:\nssm\win64\nssm.exe stop GooseRelayVPN
+C:\nssm\win64\nssm.exe remove GooseRelayVPN confirm
 ```
 
 ### مرحله ۹: اجرای کلاینت روی کامپیوتر
