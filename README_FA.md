@@ -93,7 +93,15 @@ Browser/App
 
    (عدد `vX.Y.Z` را با آخرین نسخه در صفحه Releases جایگزین کنید.)
 
-**گزینه B — ساخت از سورس (Go 1.22+):**
+> 💡 **اگر صفحه Releases باز نمی‌شود**، می‌توانید مستقیماً با لینک‌های زیر دانلود کنید (`vX.Y.Z` را با آخرین نسخه جایگزین کنید):
+> - **کلاینت — ویندوز:** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-client-vX.Y.Z-windows-amd64.zip`
+> - **کلاینت — macOS (Apple Silicon):** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-client-vX.Y.Z-darwin-arm64.tar.gz`
+> - **کلاینت — macOS (Intel):** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-client-vX.Y.Z-darwin-amd64.tar.gz`
+> - **کلاینت — لینوکس:** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-client-vX.Y.Z-linux-amd64.tar.gz`
+> - **کلاینت — اندروید/Termux:** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-client-vX.Y.Z-android-arm64.tar.gz`
+> - **سرور — لینوکس:** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-server-vX.Y.Z-linux-amd64.tar.gz`
+
+**گزینه B — ساخت از سورس (Go 1.22+) — توصیه نمی‌شود، ممکن است ناپایدار باشد:**
 
 ```bash
 git clone https://github.com/kianmhz/GooseRelayVPN.git
@@ -184,8 +192,14 @@ curl http://YOUR.VPS.IP:8443/healthz
 
 روی VPS این دستور را اجرا کنید:
 
+**لینوکس:**
 ```bash
 ./goose-server -config server_config.json
+```
+
+**ویندوز سرور:**
+```cmd
+.\goose-server.exe -config server_config.json
 ```
 
 باید آدرس listening و آدرس‌های healthz/tunnel را ببینید. این ترمینال را باز بگذارید، یا مرحله ۸ را انجام دهید تا بعد از ریبوت هم بالا بماند.
@@ -287,6 +301,45 @@ CLIENT  INFO    ready: local SOCKS5 is listening on 127.0.0.1:1080
 
 ---
 
+## راه‌اندازی اندروید (Termux)
+
+کلاینت اندروید داخل [Termux](https://termux.dev) اجرا می‌شود — فایل APK وجود ندارد. مراحل زیر را دنبال کنید:
+
+**۱. نصب و آماده‌سازی Termux:**
+```bash
+apt update && apt upgrade -y
+pkg install wget tar -y
+```
+
+**۲. دانلود و استخراج کلاینت:**
+```bash
+wget https://github.com/Kianmhz/GooseRelayVPN/releases/latest/download/GooseRelayVPN-client-v1.4.1-android-arm64.tar.gz
+tar -xzvf GooseRelayVPN-client-v1.4.1-android-arm64.tar.gz
+cd GooseRelayVPN-client-v1.4.1-android-arm64/
+```
+
+**۳. ساخت کانفیگ:**
+```bash
+cp client_config.example.json client_config.json
+nano client_config.json
+```
+`script_keys` و `tunnel_key` را پر کنید و با Ctrl+X ذخیره کنید.
+
+**۴. اجرای کلاینت:**
+```bash
+./goose-client -config client_config.json
+```
+
+وقتی `ready: local SOCKS5 is listening on 127.0.0.1:1080` را دیدید یعنی همه چیز درست است.
+
+**۵. اتصال اپ‌ها:**
+
+از یک اپ با پشتیبانی SOCKS5 برای روت کردن ترافیک از طریق `127.0.0.1:1080` استفاده کنید. [NekoBox](https://github.com/MatsuriDayo/NekoBoxForAndroid) و [v2rayNG](https://github.com/2dust/v2rayNG) هر دو خوب کار می‌کنند:
+- یک پروکسی SOCKS5 به آدرس `127.0.0.1:1080` اضافه کنید
+- در **per-app settings**، پروکسی را برای اپ‌های دلخواه فعال کنید و **Termux را از VPN خارج کنید** تا تونل قطع نشود
+
+---
+
 ## اشتراک‌گذاری LAN (اختیاری)
 
 به‌صورت پیش‌فرض کلاینت روی `127.0.0.1:1080` گوش می‌دهد، پس فقط کامپیوتر شما می‌تواند استفاده کند. برای اشتراک در شبکه محلی، `socks_host` را در `client_config.json` به `0.0.0.0` تغییر دهید و کلاینت را ری‌استارت کنید.
@@ -297,7 +350,7 @@ CLIENT  INFO    ready: local SOCKS5 is listening on 127.0.0.1:1080
 
 ## افزایش ظرفیت با چند deployment (پیشنهاد می‌شود)
 
-هر اکانت گوگل برای هر deployment در Apps Script سهمیه روزانه **~۲۰٬۰۰۰ فراخوانی** دارد. کلاینت در حالت بی‌کار حدود یک بار در ثانیه poll می‌کند، پس یک deployment برای استفاده پایدار کافی است، اما روزهای پرترافیک به سقف می‌رسند. برای عبور از این محدودیت، `Code.gs` را چندبار deploy کنید — با همان اکانت یا چند اکانت — و همه Deployment IDها را در `script_keys` بگذارید:
+سهمیه **~۲۰٬۰۰۰ فراخوانی در روز به ازای هر اکانت گوگل** اعمال می‌شود، نه به ازای هر deployment یا پروژه — همه deploymentهای یک اکانت از یک quota مشترک استفاده می‌کنند. کلاینت در حالت بی‌کار حدود یک بار در ثانیه poll می‌کند، اما اپ‌های real-time مثل **تلگرام یا X می‌توانند quota را ظرف چند ساعت تمام کنند**. برای عبور از این محدودیت، `Code.gs` را روی **اکانت‌های مختلف گوگل** deploy کنید و همه Deployment IDها را در `script_keys` بگذارید:
 
 ```json
 {

@@ -93,7 +93,15 @@ You need two separate programs:
 
    (Replace `vX.Y.Z` with the latest version number from the Releases page.)
 
-**Option B — Build from source (Go 1.22+):**
+> 💡 **If the Releases page doesn't open**, you can download directly using these links (replace `vX.Y.Z` with the latest version):
+> - **Client — Windows:** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-client-vX.Y.Z-windows-amd64.zip`
+> - **Client — macOS (Apple Silicon):** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-client-vX.Y.Z-darwin-arm64.tar.gz`
+> - **Client — macOS (Intel):** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-client-vX.Y.Z-darwin-amd64.tar.gz`
+> - **Client — Linux:** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-client-vX.Y.Z-linux-amd64.tar.gz`
+> - **Client — Android/Termux:** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-client-vX.Y.Z-android-arm64.tar.gz`
+> - **Server — Linux:** `https://github.com/Kianmhz/GooseRelayVPN/releases/download/vX.Y.Z/GooseRelayVPN-server-vX.Y.Z-linux-amd64.tar.gz`
+
+**Option B — Build from source (Go 1.22+) — not recommended, may be unstable:**
 
 ```bash
 git clone https://github.com/kianmhz/GooseRelayVPN.git
@@ -184,11 +192,17 @@ You should get an empty response with HTTP 200. If `curl` times out or refuses, 
 
 On your VPS, run the server binary:
 
+**Linux:**
 ```bash
 ./goose-server -config server_config.json
 ```
 
-You should see it print the listening address and the healthz/tunnel URLs. Leave this terminal open, or set up the systemd service (Step 8) to keep it running after reboots.
+**Windows Server:**
+```cmd
+.\goose-server.exe -config server_config.json
+```
+
+You should see it print the listening address and the healthz/tunnel URLs. Leave this terminal open, or set up the systemd/NSSM service (Step 8) to keep it running after reboots.
 
 ### Step 8: Keep the server running after reboot (systemd)
 
@@ -287,6 +301,45 @@ Now set your browser to use SOCKS5 proxy `127.0.0.1:1080`:
 
 ---
 
+## Android Setup (Termux)
+
+The Android client runs inside [Termux](https://termux.dev) — there is no APK. Follow these steps:
+
+**1. Install and set up Termux:**
+```bash
+apt update && apt upgrade -y
+pkg install wget tar -y
+```
+
+**2. Download and extract the client:**
+```bash
+wget https://github.com/Kianmhz/GooseRelayVPN/releases/latest/download/GooseRelayVPN-client-v1.4.1-android-arm64.tar.gz
+tar -xzvf GooseRelayVPN-client-v1.4.1-android-arm64.tar.gz
+cd GooseRelayVPN-client-v1.4.1-android-arm64/
+```
+
+**3. Create your config:**
+```bash
+cp client_config.example.json client_config.json
+nano client_config.json
+```
+Fill in your `script_keys` and `tunnel_key`, then save with Ctrl+X.
+
+**4. Run the client:**
+```bash
+./goose-client -config client_config.json
+```
+
+When you see `ready: local SOCKS5 is listening on 127.0.0.1:1080` it's working.
+
+**5. Connect your apps:**
+
+Use a SOCKS5-aware app to route traffic through `127.0.0.1:1080`. [NekoBox](https://github.com/MatsuriDayo/NekoBoxForAndroid) and [v2rayNG](https://github.com/2dust/v2rayNG) both work well:
+- Add a SOCKS5 proxy pointing to `127.0.0.1:1080`
+- In **per-app settings**, enable the proxy for the apps you want and **exclude Termux** from the VPN so the tunnel itself stays connected
+
+---
+
 ## LAN Sharing (Optional)
 
 By default the client listens on `127.0.0.1:1080` so only your computer can use it. To share with other devices on your local network, set `socks_host` to `0.0.0.0` in `client_config.json` and restart.
@@ -297,7 +350,7 @@ By default the client listens on `127.0.0.1:1080` so only your computer can use 
 
 ## Increase capacity with multiple deployments (recommended)
 
-Each Google account's Apps Script deployment is rate-limited to **~20,000 calls/day**. The client polls about once per second when idle, so a single deployment can sustain steady use, but heavy days hit the cap. To go beyond that, deploy `Code.gs` multiple times — under the same Google account or a few different ones — and put all the Deployment IDs into `script_keys`:
+The **~20,000 calls/day quota applies per Google account**, not per deployment or project — all deployments under the same account share one quota pool. The client polls about once per second when idle, so a single deployment can sustain steady use, but heavy days hit the cap. Real-time apps like **Telegram or X can drain the quota within a few hours** due to constant polling. To go beyond that, deploy `Code.gs` across **different Google accounts** and put all the Deployment IDs into `script_keys`:
 
 ```json
 {
