@@ -44,12 +44,23 @@ const (
 	MaxFramePayload = 256 * 1024
 
 	// upstreamReadBuf is the chunk size for reading from real net.Conn before
-	// pushing to session.EnqueueTx (which then chunks into frames).
-	upstreamReadBuf = 128 * 1024
+	// pushing to session.EnqueueTx (which then chunks into frames). Matches
+	// MaxFramePayload so a single TCP read fills exactly one max-sized frame:
+	// halves the frames-per-MB count on bulk downloads vs. 128KB, which cuts
+	// length-prefix and Unmarshal overhead on the receiving carrier.
+	upstreamReadBuf = 256 * 1024
 
 	// coalesceWindow lets us gather a few more frames before responding, which
 	// improves throughput for video streams under higher RTT links.
 	coalesceWindow = 25 * time.Millisecond
+
+	// coalesceWindowBusy is used when many sessions are active concurrently:
+	// under high fan-out the next batch fills within a few ms, so 25ms of
+	// extra accumulation is pure tail latency. Only applied when a) the
+	// session count is above busySessionThreshold and b) the current batch
+	// is not already large (>= maxDrainFramesPerBatch/2) — large batches
+	// are bulk-dominant and benefit more from full coalesce.
+	coalesceWindowBusy = 10 * time.Millisecond
 
 	// coalesceMinFrames is the minimum number of frames in a drain before we
 	// bother waiting coalesceWindow. Batches at or below this threshold are
@@ -258,7 +269,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			// Urgent batches (RSTs, first downstream after SYN) skip coalesce
 			// unconditionally so connection setup is not delayed.
 			if !urgent && len(txFrames) > coalesceMinFrames {
-				coalesceDeadline := time.Now().Add(coalesceWindow)
+				coalesceDeadline := time.Now().Add(s.coalesceDuration(len(txFrames)))
 			coalesceLoop:
 				for {
 					if time.Now().After(coalesceDeadline) {
@@ -325,6 +336,21 @@ func (s *Server) drainWindow(rxFrames []*frame.Frame) time.Duration {
 		return ActiveDrainWindow
 	}
 	return LongPollWindow
+}
+
+// coalesceDuration picks the coalesce window for the current drain. Under
+// high session fan-out we shrink the window: the next batch fills within
+// a few ms anyway, and 25ms of extra accumulation per response just adds
+// tail latency. Large batches (already half-full or more) keep the full
+// 25ms because they are bulk-dominant and benefit from extra throughput.
+func (s *Server) coalesceDuration(currentFrames int) time.Duration {
+	s.mu.Lock()
+	sessionCount := len(s.sessions)
+	s.mu.Unlock()
+	if sessionCount >= busySessionThreshold && currentFrames < maxDrainFramesPerBatch/2 {
+		return coalesceWindowBusy
+	}
+	return coalesceWindow
 }
 
 // routeIncoming routes one incoming frame to its session, creating the session
