@@ -19,7 +19,7 @@ function doPost(e) {
     payload: payload,
     muteHttpExceptions: true,
     followRedirects: false,
-    deadline: 30,  // seconds; our long-poll window is 8s so this is plenty
+    deadline: 30,  // seconds; long-poll window is kept at 8s for Apps Script stability
   });
   return ContentService
     .createTextOutput(resp.getContentText())
