@@ -414,6 +414,12 @@ GooseRelayVPN/
 
 ---
 
+## Known Issues
+
+- **Using too many deployment IDs can cause instability.** There is a current known issue where configuring a large number of `script_keys` degrades performance or causes connection problems. Until this is resolved, **stick to 3–4 deployment IDs**.
+
+---
+
 ## Troubleshooting
 
 | Problem | Solution |
