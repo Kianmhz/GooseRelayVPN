@@ -319,6 +319,58 @@ func TestExit_MultiClient_RejectsSessionSpoof(t *testing.T) {
 	}
 }
 
+// TestExit_SYNDialsRunInParallel is the regression test for the
+// head-of-line blocking issue observed in production logs (issue #23
+// follow-up): when a batch of N SYNs arrives and the first SYN dials a
+// dead target, every subsequent SYN in the batch used to wait the full
+// dial timeout sequentially. handleTunnel now parallelizes SYN dials.
+//
+// Three SYNs each take ~600 ms to dial. Sequentially that is ~1.8 s;
+// in parallel it is ~600 ms. We assert the batch completes under
+// 1.2 s — comfortably below sequential, comfortably above any flake
+// floor on slow CI.
+func TestExit_SYNDialsRunInParallel(t *testing.T) {
+	s := mustExitTimingServer(t)
+	c := mustExitTimingCrypto(t)
+
+	const dialDelay = 600 * time.Millisecond
+	s.dial = func(_, addr string, _ time.Duration) (net.Conn, error) {
+		time.Sleep(dialDelay)
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errSimulatedDialFail{}}
+	}
+
+	clientID := [frame.ClientIDLen]byte{0xCC}
+	frames := []*frame.Frame{
+		{SessionID: [frame.SessionIDLen]byte{0xA1}, Flags: frame.FlagSYN, Target: "a.example:443"},
+		{SessionID: [frame.SessionIDLen]byte{0xB2}, Flags: frame.FlagSYN, Target: "b.example:443"},
+		{SessionID: [frame.SessionIDLen]byte{0xC3}, Flags: frame.FlagSYN, Target: "c.example:443"},
+	}
+
+	muteLogsForBench(t)
+	body, err := frame.EncodeBatch(c, clientID, frames)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/tunnel", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	t0 := time.Now()
+	s.handleTunnel(rec, req)
+	elapsed := time.Since(t0)
+
+	// Sequential bound = 3 × dialDelay = 1.8 s. Parallel bound ≈ dialDelay = 600 ms.
+	// Plus the ActiveDrainWindow (350 ms) that handleTunnel waits after dialing.
+	if elapsed > dialDelay+ActiveDrainWindow+250*time.Millisecond {
+		t.Fatalf("3 SYNs dispatched serially: elapsed=%v (expected ~%v in parallel)",
+			elapsed, dialDelay+ActiveDrainWindow)
+	}
+}
+
+type errSimulatedDialFail struct{}
+
+func (errSimulatedDialFail) Error() string   { return "simulated dial fail" }
+func (errSimulatedDialFail) Timeout() bool   { return false }
+func (errSimulatedDialFail) Temporary() bool { return false }
+
 func TestIsBackoffEligibleDialErr(t *testing.T) {
 	if !isBackoffEligibleDialErr(&net.OpError{Err: syscall.ECONNREFUSED}) {
 		t.Fatal("expected ECONNREFUSED to be backoff-eligible")

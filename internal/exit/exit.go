@@ -260,8 +260,27 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		s.stats.bytesIn.Add(bytesIn)
 	}
 
+	// Process SYN frames in parallel — each routeIncoming on a SYN may dial
+	// upstream synchronously, and a single bad target (typo'd / stale DNS /
+	// unroutable IP) used to block every other SYN behind it for the full
+	// dial timeout. Non-SYN frames are still routed sequentially after the
+	// SYN goroutines finish so a DATA frame that lands in the same batch as
+	// its own SYN doesn't race the openSession registration.
+	var synWG sync.WaitGroup
 	for _, f := range rxFrames {
-		s.routeIncoming(f, clientID)
+		if f.HasFlag(frame.FlagSYN) {
+			synWG.Add(1)
+			go func(f *frame.Frame) {
+				defer synWG.Done()
+				s.routeIncoming(f, clientID)
+			}(f)
+		}
+	}
+	synWG.Wait()
+	for _, f := range rxFrames {
+		if !f.HasFlag(frame.FlagSYN) {
+			s.routeIncoming(f, clientID)
+		}
 	}
 
 	// Capture the per-client wake channel before entering the wait loop so a
