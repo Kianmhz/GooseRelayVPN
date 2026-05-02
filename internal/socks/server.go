@@ -21,6 +21,12 @@ type SessionFactory func(target string) *session.Session
 // a VirtualConn over a fresh tunneled session. The DNS resolver is overridden
 // with a no-op to prevent local DNS leaks (clients must use socks5h://).
 //
+// Wraps the listener with a TCP_NODELAY + TCP_QUICKACK applying acceptor so
+// the kernel doesn't introduce 40 ms Nagle delays on small SOCKS payloads
+// (HTTP request lines, TLS handshake records) and doesn't hold back ACKs for
+// up to 40 ms on small request/reply pairs. The exit side already disables
+// Nagle for upstream connections; mirroring on the local side closes the loop.
+//
 // When user and pass are both non-empty, RFC 1929 username/password
 // authentication is required; unauthenticated clients are rejected.
 //
@@ -47,8 +53,35 @@ func Serve(_ context.Context, listenAddr, user, pass string, factory SessionFact
 			},
 		}))
 	}
+
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return err
+	}
 	server := socks5.NewServer(opts...)
-	return server.ListenAndServe("tcp", listenAddr)
+	return server.Serve(&noDelayListener{Listener: ln})
+}
+
+// noDelayListener wraps net.Listener so each accepted *net.TCPConn has both
+// SetNoDelay(true) and (on Linux) TCP_QUICKACK applied. This eliminates the
+// kernel's 40 ms Nagle delay on small SOCKS write payloads and the 40 ms
+// delayed-ACK on small read replies — together they cover both directions
+// of every interactive request/reply pair (DNS-over-HTTPS, REST GETs, TLS
+// handshake records).
+type noDelayListener struct {
+	net.Listener
+}
+
+func (l *noDelayListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if tcp, ok := c.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
+	setQuickAck(c)
+	return c, nil
 }
 
 // noopResolver is a SOCKS5 name resolver that returns the host string verbatim
