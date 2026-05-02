@@ -155,10 +155,41 @@ func TestDecodeBatch_TamperedBatchFails(t *testing.T) {
 	}
 	var zeroClient [ClientIDLen]byte
 	body, _ := EncodeBatch(c, zeroClient, in)
-	raw, _ := base64.StdEncoding.DecodeString(string(body))
+	raw, _ := b64Encoding.DecodeString(string(body))
 	raw[len(raw)/2] ^= 0x01 // flip a bit in the middle of the ciphertext
-	tampered := []byte(base64.StdEncoding.EncodeToString(raw))
-	if _, _, err := DecodeBatch(c, tampered); err == nil {
+	out := make([]byte, b64Encoding.EncodedLen(len(raw)))
+	b64Encoding.Encode(out, raw)
+	if _, _, err := DecodeBatch(c, out); err == nil {
 		t.Fatal("expected auth error on tampered batch, got nil")
+	}
+}
+
+func TestDecodeBatch_LegacyPadding(t *testing.T) {
+	c := newTestCrypto(t)
+	in := []*Frame{{SessionID: sid(1), Payload: []byte("legacy")}}
+	var zeroClient [ClientIDLen]byte
+
+	// Manually construct a padded base64 batch (like an older version would).
+	plainSize := ClientIDLen + 2 + 4 + 1 + 8 + 6 // header + u16 + u32 len + flags + sid + payload
+	plain := make([]byte, 0, plainSize)
+	plain = append(plain, zeroClient[:]...)
+	plain = append(plain, 0, 1) // count = 1
+	rawFrame, _ := in[0].Marshal()
+	plain = append(plain, byte(len(rawFrame)>>24), byte(len(rawFrame)>>16), byte(len(rawFrame)>>8), byte(len(rawFrame)))
+	plain = append(plain, rawFrame...)
+
+	sealed, _ := c.Seal(plain)
+	legacyBody := []byte(base64.StdEncoding.EncodeToString(sealed))
+
+	// Should still decode correctly.
+	gotClient, out, err := DecodeBatch(c, legacyBody)
+	if err != nil {
+		t.Fatalf("decode legacy: %v", err)
+	}
+	if gotClient != zeroClient {
+		t.Fatal("clientID mismatch")
+	}
+	if len(out) != 1 || !bytes.Equal(out[0].Payload, in[0].Payload) {
+		t.Fatal("payload mismatch")
 	}
 }
