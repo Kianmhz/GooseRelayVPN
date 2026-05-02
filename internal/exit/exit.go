@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -596,14 +597,31 @@ func (s *Server) drainAll(owner [frame.ClientIDLen]byte, byteBudget int) ([]*fra
 	}
 	remaining := batchCap
 	remainingBytes := byteBudget
+
+	// Snapshot and sort active sessions by queue age to ensure fairness.
+	type sessionRef struct {
+		id      [frame.SessionIDLen]byte
+		queuedAt time.Time
+	}
+	refs := make([]sessionRef, 0, len(s.txReady))
 	for id := range s.txReady {
+		if sess, ok := s.sessions[id]; ok {
+			if s.sessionOwners[id] != owner {
+				continue
+			}
+			refs = append(refs, sessionRef{id: id, queuedAt: sess.FirstQueuedAt()})
+		} else {
+			delete(s.txReady, id)
+		}
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		return refs[i].queuedAt.Before(refs[j].queuedAt)
+	})
+
+	for _, r := range refs {
+		id := r.id
 		if remaining <= 0 || remainingBytes <= 0 {
 			break
-		}
-		if s.sessionOwners[id] != owner {
-			// Belongs to a different client; leave the txReady entry in place
-			// so that client's poll picks it up.
-			continue
 		}
 		sess, ok := s.sessions[id]
 		if !ok {
