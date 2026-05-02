@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // Crypto wraps an AES-256-GCM AEAD with the relay-tunnel envelope format:
@@ -75,6 +76,21 @@ func (c *Crypto) Open(envelope []byte) ([]byte, error) {
 // are never delivered to a different client polling the same server.
 const ClientIDLen = 16
 
+// batchPool reuses the marshaled-slice scratch and the plaintext header
+// buffer across EncodeBatch calls. Without pooling, each batch allocates two
+// fresh buffers (the plain header + the marshaled-frame slice header), which
+// is meaningful at our drain rate (≤ every 350 ms per worker, 3 workers).
+var (
+	encPlainPool = sync.Pool{New: func() interface{} {
+		buf := make([]byte, 0, 64*1024)
+		return &buf
+	}}
+	encMarshaledPool = sync.Pool{New: func() interface{} {
+		buf := make([][]byte, 0, 32)
+		return &buf
+	}}
+)
+
 // EncodeBatch packs zero or more frames into a base64-encoded HTTP body.
 //
 // Wire format (before base64):
@@ -99,18 +115,41 @@ func EncodeBatch(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame) ([]byte
 	}
 
 	// Marshal all frames first so we know the exact plaintext size.
-	marshaled := make([][]byte, len(frames))
+	marshaledP := encMarshaledPool.Get().(*[][]byte)
+	marshaled := (*marshaledP)[:0]
+	defer func() {
+		for i := range marshaled {
+			marshaled[i] = nil
+		}
+		marshaled = marshaled[:0]
+		*marshaledP = marshaled
+		encMarshaledPool.Put(marshaledP)
+	}()
+
 	plainSize := ClientIDLen + 2 // client_id + u16 frame count
-	for i, f := range frames {
+	for _, f := range frames {
 		raw, err := f.Marshal()
 		if err != nil {
 			return nil, fmt.Errorf("batch: marshal frame: %w", err)
 		}
-		marshaled[i] = raw
+		marshaled = append(marshaled, raw)
 		plainSize += 4 + len(raw) // u32 length prefix + frame bytes
 	}
 
-	plain := make([]byte, 0, plainSize)
+	// Pull a plaintext scratch buffer from the pool; grow if needed.
+	plainP := encPlainPool.Get().(*[]byte)
+	plain := (*plainP)[:0]
+	if cap(plain) < plainSize {
+		plain = make([]byte, 0, plainSize)
+	}
+	defer func() {
+		// Reset and return to pool. The capacity is preserved so the next
+		// EncodeBatch reuses the same underlying allocation.
+		plain = plain[:0]
+		*plainP = plain
+		encPlainPool.Put(plainP)
+	}()
+
 	plain = append(plain, clientID[:]...)
 	plain = append(plain, byte(len(frames)>>8), byte(len(frames)))
 	for _, raw := range marshaled {

@@ -144,6 +144,10 @@ type Server struct {
 	// otherwise return empty and burn through HTTP requests.
 	activity map[[frame.ClientIDLen]byte]chan struct{}
 	stats    serverStats
+
+	// upstreamReadPool is a sync.Pool of upstreamReadBuf (256KiB) buffers
+	// reused across upstream pump goroutines.
+	upstreamReadPool sync.Pool
 }
 
 // serverStats holds atomic counters surfaced periodically by runStatsLoop.
@@ -168,7 +172,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	dialFn := dialFunc(cfg.UpstreamProxy)
-	return &Server{
+	s := &Server{
 		cfg:           cfg,
 		aead:          aead,
 		dial:          dialFn,
@@ -183,7 +187,12 @@ func New(cfg Config) (*Server, error) {
 		dialFail:      make(map[string]time.Time),
 		pendingRSTs:   make(map[[frame.ClientIDLen]byte][]*frame.Frame),
 		activity:      make(map[[frame.ClientIDLen]byte]chan struct{}),
-	}, nil
+	}
+	s.upstreamReadPool.New = func() interface{} {
+		buf := make([]byte, upstreamReadBuf)
+		return &buf
+	}
+	return s, nil
 }
 
 // dialFunc returns a dial function. When proxyAddr is non-empty it routes all
@@ -531,7 +540,14 @@ func (s *Server) openSession(id [frame.SessionIDLen]byte, target string, owner [
 	// Upstream → session.EnqueueTx (downstream direction).
 	go func() {
 		defer upstream.Close()
-		buf := make([]byte, upstreamReadBuf)
+		bufP := s.upstreamReadPool.Get().(*[]byte)
+		buf := *bufP
+		defer func() {
+			// Zero the pointer so we don't accidentally hold a reference;
+			// the pool returns the slice header so future Reads get a fresh
+			// buffer view but back the same allocation.
+			s.upstreamReadPool.Put(bufP)
+		}()
 		firstRead := true
 		for {
 			n, err := upstream.Read(buf)
