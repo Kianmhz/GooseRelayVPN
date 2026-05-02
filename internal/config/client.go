@@ -263,7 +263,17 @@ func LoadClient(path string) (*Client, error) {
 	if useFronting {
 		googleHost := firstNonEmpty(f.GoogleHost, "216.239.38.120")
 		googlePort := 443
-		googleIP = net.JoinHostPort(googleHost, strconv.Itoa(googlePort))
+
+		// Support comma-separated IPs in google_host.
+		hosts := strings.Split(googleHost, ",")
+		var ipPorts []string
+		for _, h := range hosts {
+			h = strings.TrimSpace(h)
+			if h != "" {
+				ipPorts = append(ipPorts, net.JoinHostPort(h, strconv.Itoa(googlePort)))
+			}
+		}
+		googleIP = strings.Join(ipPorts, ",")
 		sniHosts = parseSNIHosts(f.SNI)
 
 		if len(f.ScriptKeys) == 0 {
