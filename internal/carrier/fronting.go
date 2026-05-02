@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,8 +30,12 @@ const frontedProbeOKBody = "GooseRelay forwarder OK"
 // with its own connection pool, which maps to a separate TLS SNI value and
 // therefore a separate per-domain throttle bucket on the Google CDN. Requests
 // are distributed across clients in round-robin order.
+//
+// GoogleIP may be a single "ip:port" or a comma-separated list of "ip:port"
+// values. With multiple IPs each dial round-robins across them so a single
+// brittle Google PoP can't bring the tunnel down.
 type FrontingConfig struct {
-	GoogleIP string   // "ip:443"
+	GoogleIP string   // "ip:443" or "ip1:443,ip2:443"
 	SNIHosts []string // e.g. ["www.google.com", "mail.google.com", "accounts.google.com"]
 }
 
@@ -51,6 +56,7 @@ func NewFrontedClients(cfg FrontingConfig, pollTimeout time.Duration, probeURL s
 	if len(hosts) == 0 {
 		hosts = []string{"www.google.com"}
 	}
+	googleIPs := splitGoogleIPs(cfg.GoogleIP)
 	caches := make(map[string]tls.ClientSessionCache, len(hosts))
 	for _, sni := range hosts {
 		if _, ok := caches[sni]; !ok {
@@ -59,14 +65,33 @@ func NewFrontedClients(cfg FrontingConfig, pollTimeout time.Duration, probeURL s
 	}
 	clients := make([]*http.Client, len(hosts))
 	for i, sni := range hosts {
-		clients[i] = newFrontedClient(cfg.GoogleIP, sni, pollTimeout, caches[sni])
+		clients[i] = newFrontedClient(googleIPs, sni, pollTimeout, caches[sni])
 	}
 	hosts, clients = filterFrontedClientsByProbe(hosts, clients, probeURL)
 	// Best-effort: warm each SNI's TLS session in the background so the
 	// first real poll resumes (saves ~140 ms TLS handshake per cold conn).
 	// Zero Apps Script executions consumed; failures are silently ignored.
-	prewarmFrontedClients(cfg.GoogleIP, hosts, caches)
+	prewarmFrontedClients(googleIPs, hosts, caches)
 	return clients
+}
+
+// splitGoogleIPs accepts either a single "ip:port" or a comma-separated list,
+// trims whitespace, and returns the parsed slice. An empty/whitespace input
+// returns nil so dialContext falls back to default DNS resolution.
+func splitGoogleIPs(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 type frontedProbeResult struct {
@@ -282,7 +307,7 @@ func logFrontedProbeDecision(results []frontedProbeResult, keep []int) {
 // with a short deadline; the read errors out on deadline but by then the
 // crypto/tls layer has consumed the post-handshake message and stored the
 // ticket in the cache.
-func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string]tls.ClientSessionCache) {
+func prewarmFrontedClients(googleIPs []string, sniHosts []string, caches map[string]tls.ClientSessionCache) {
 	const (
 		dialTimeout   = 3 * time.Second
 		ticketWindow  = 500 * time.Millisecond
@@ -293,7 +318,10 @@ func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string
 		go func(sniHost string, cache tls.ClientSessionCache) {
 			ctx, cancel := context.WithTimeout(context.Background(), overallBudget)
 			defer cancel()
-			addr := googleIP
+			addr := ""
+			if len(googleIPs) > 0 {
+				addr = googleIPs[0]
+			}
 			if addr == "" {
 				addr = net.JoinHostPort(sniHost, "443")
 			}
@@ -324,17 +352,34 @@ func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string
 	}
 }
 
-// newFrontedClient builds a single *http.Client that dials googleIP and
-// presents sniHost in the TLS handshake.
-func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessionCache tls.ClientSessionCache) *http.Client {
+// newFrontedClient builds a single *http.Client that dials one of googleIPs
+// (round-robin) and presents sniHost in the TLS handshake.
+func newFrontedClient(googleIPs []string, sniHost string, pollTimeout time.Duration, sessionCache tls.ClientSessionCache) *http.Client {
 	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 
+	var rrCounter atomic.Uint64
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if googleIP != "" {
-				return dialer.DialContext(ctx, "tcp", googleIP)
+			if len(googleIPs) == 0 {
+				return dialer.DialContext(ctx, network, addr)
 			}
-			return dialer.DialContext(ctx, network, addr)
+			// Round-robin across configured Google IPs so a single brittle
+			// edge node can't take the tunnel down. For one configured IP this
+			// reduces to the previous behavior.
+			idx := rrCounter.Add(1) - 1
+			ip := googleIPs[idx%uint64(len(googleIPs))]
+			conn, err := dialer.DialContext(ctx, "tcp", ip)
+			if err != nil && len(googleIPs) > 1 {
+				// Try the next IP exactly once; if the first attempt failed
+				// (TCP RST, host unreachable, slow handshake) we don't want
+				// to fail the whole poll while another known-good IP is
+				// available in the same client.
+				next := googleIPs[(idx+1)%uint64(len(googleIPs))]
+				if conn2, err2 := dialer.DialContext(ctx, "tcp", next); err2 == nil {
+					return conn2, nil
+				}
+			}
+			return conn, err
 		},
 		TLSClientConfig: &tls.Config{
 			ServerName: sniHost,
