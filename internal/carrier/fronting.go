@@ -303,7 +303,11 @@ func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string
 			}
 			defer rawConn.Close()
 			tlsConn := tls.Client(rawConn, &tls.Config{
-				ServerName:         sniHost,
+				ServerName: sniHost,
+				// Require TLS 1.3 to (a) eliminate TLS 1.2's 2-RTT handshake on
+				// cold pools and (b) get ChaCha20-Poly1305 negotiation when the
+				// CPU lacks AES-NI. All Google front-ends advertise 1.3.
+				MinVersion:         tls.VersionTLS13,
 				ClientSessionCache: cache,
 				// Match the real http.Transport ALPN so the resumed
 				// session is usable by HTTP/2 in the actual poll.
@@ -338,6 +342,10 @@ func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessi
 		},
 		TLSClientConfig: &tls.Config{
 			ServerName: sniHost,
+			// Require TLS 1.3 to (a) eliminate TLS 1.2's 2-RTT handshake on
+			// cold pools and (b) get ChaCha20-Poly1305 negotiation when the
+			// CPU lacks AES-NI. All Google front-ends advertise 1.3.
+			MinVersion: tls.VersionTLS13,
 			// Enable TLS session resumption tickets so reconnects after
 			// idle timeout (and the prewarm dial in NewFrontedClients) can
 			// skip a full handshake round-trip.
