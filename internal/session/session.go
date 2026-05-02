@@ -51,11 +51,12 @@ type Session struct {
 	rxSeq   uint64
 	rxQueue map[uint64]*frame.Frame
 
-	synNeeded bool // first outgoing frame must carry SYN+Target
-	closeReq  bool // VirtualConn.Close() called; FIN must be sent on next drain
-	finSent   bool
-	finSentAt time.Time // when finSent was set; used for orphan reaping
-	rxClosed  bool      // RxChan has been closed (peer FIN received)
+	synNeeded     bool // first outgoing frame must carry SYN+Target
+	closeReq      bool // VirtualConn.Close() called; FIN must be sent on next drain
+	finSent       bool
+	finSentAt     time.Time // when finSent was set; used for orphan reaping
+	firstQueuedAt time.Time // timestamp of the oldest frame waiting to be sent
+	rxClosed      bool      // RxChan has been closed (peer FIN received)
 
 	RxChan chan []byte
 
@@ -84,6 +85,9 @@ func New(id [frame.SessionIDLen]byte, target string, needsSYN bool) *Session {
 		synNeeded: needsSYN,
 		rxInbox:   make(chan *frame.Frame, rxInboxCap),
 		rxDone:    make(chan struct{}),
+	}
+	if needsSYN {
+		s.firstQueuedAt = time.Now()
 	}
 	s.txCond = sync.NewCond(&s.mu)
 	go s.rxLoop()
@@ -135,6 +139,9 @@ func (s *Session) EnqueueTx(data []byte) {
 		return
 	}
 	s.txBuf = append(s.txBuf, data...)
+	if s.firstQueuedAt.IsZero() {
+		s.firstQueuedAt = time.Now()
+	}
 	cb := s.OnTx
 	s.mu.Unlock()
 	if cb != nil {
@@ -154,6 +161,9 @@ func (s *Session) EnqueueInitialData(data []byte) {
 	}
 	// Prepend to txBuf so it's picked up by the first DrainTx call.
 	s.txBuf = append(data, s.txBuf...)
+	if s.firstQueuedAt.IsZero() {
+		s.firstQueuedAt = time.Now()
+	}
 	cb := s.OnTx
 	s.mu.Unlock()
 	if cb != nil {
@@ -166,6 +176,9 @@ func (s *Session) EnqueueInitialData(data []byte) {
 func (s *Session) RequestClose() {
 	s.mu.Lock()
 	s.closeReq = true
+	if s.firstQueuedAt.IsZero() {
+		s.firstQueuedAt = time.Now()
+	}
 	s.txCond.Broadcast()
 	cb := s.OnTx
 	s.mu.Unlock()
@@ -198,6 +211,13 @@ func (s *Session) HasPendingSYN() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.synNeeded
+}
+
+// FirstQueuedAt returns the timestamp of the oldest frame waiting to be sent.
+func (s *Session) FirstQueuedAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.firstQueuedAt
 }
 
 // IsDone reports whether both FIN frames (sent and received) have flowed,
@@ -324,6 +344,11 @@ func (s *Session) drainTx(maxPayload, maxFrames int) []*frame.Frame {
 		s.txSeq++
 		s.finSent = true
 		s.finSentAt = time.Now()
+	}
+
+	// If everything was drained, clear the queue timestamp.
+	if !s.synNeeded && len(s.txBuf) == 0 && !(s.closeReq && !s.finSent) {
+		s.firstQueuedAt = time.Time{}
 	}
 
 	s.txCond.Broadcast() // wake any backpressured writers

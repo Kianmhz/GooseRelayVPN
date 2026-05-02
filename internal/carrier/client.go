@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -656,6 +657,23 @@ func (c *Client) drainAll() ([]*frame.Frame, [][frame.SessionIDLen]byte) {
 	}
 	remaining := batchCap
 
+	// Snapshot and sort active sessions by queue age to ensure fairness.
+	type sessionRef struct {
+		id      [frame.SessionIDLen]byte
+		queuedAt time.Time
+	}
+	refs := make([]sessionRef, 0, len(c.txReady))
+	for id := range c.txReady {
+		if s, ok := c.sessions[id]; ok {
+			refs = append(refs, sessionRef{id: id, queuedAt: s.FirstQueuedAt()})
+		} else {
+			delete(c.txReady, id)
+		}
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		return refs[i].queuedAt.Before(refs[j].queuedAt)
+	})
+
 	drain := func(id [frame.SessionIDLen]byte, synOnly bool) {
 		if remaining <= 0 {
 			return
@@ -689,12 +707,12 @@ func (c *Client) drainAll() ([]*frame.Frame, [][frame.SessionIDLen]byte) {
 	// First pass: SYN sessions only. New connections claim batch slots before
 	// ongoing data transfers so a large upload/download cannot push SYN frames
 	// out of the batch and delay connection setup by a full poll cycle.
-	for id := range c.txReady {
-		drain(id, true)
+	for _, r := range refs {
+		drain(r.id, true)
 	}
 	// Second pass: remaining data sessions.
-	for id := range c.txReady {
-		drain(id, false)
+	for _, r := range refs {
+		drain(r.id, false)
 	}
 	return out, drainedIDs
 }
