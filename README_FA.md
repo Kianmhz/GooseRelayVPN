@@ -168,7 +168,7 @@ cp server_config.example.json server_config.json
 
 1. وارد [Google Apps Script](https://script.google.com/) شوید و لاگین کنید.
 2. روی **New project** کلیک کنید.
-3. کد پیش‌فرض را حذف کنید و همه محتوای [`apps_script/Code.gs`](apps_script/Code.gs) را جایگزین کنید.
+3. کد پیش‌فرض را حذف کنید و همه محتوای [`apps_script/Code.js`](apps_script/Code.js) را جایگزین کنید.
 4. این خط را با IP VPS خودتان جایگزین کنید:
    ```javascript
    const VPS_URL = 'http://YOUR.VPS.IP:8443/tunnel';
@@ -178,9 +178,9 @@ cp server_config.example.json server_config.json
 7. روی **Deploy** بزنید. یک پنجره باز می‌شود که **Deployment ID** را نشان می‌دهد. آن را کپی و در `script_keys` قرار دهید.
 8. آن Deployment ID را در `script_keys` داخل `client_config.json` هم وارد کنید.
 
-> ⚠️ هر بار که `Code.gs` را ویرایش می‌کنید باید **یک deployment جدید** بسازید (Deploy → **New deployment**) و `script_keys` را به‌روزرسانی کنید. صرفاً ذخیره کردن کد کافی نیست.
+> ⚠️ هر بار که `Code.js` را ویرایش می‌کنید باید **یک deployment جدید** بسازید (Deploy → **New deployment**) و `script_keys` را به‌روزرسانی کنید. صرفاً ذخیره کردن کد کافی نیست.
 
-نسخهٔ جدید `Code.gs` در `doGet` متادیتای نسخه/پروتکل را هم برمی‌گرداند تا بررسی pre-flight بتواند ناسازگاری نسخه را تشخیص دهد. اگر deployment قدیمی باشد، باید یک‌بار دوباره deploy کنید تا هشدار ناسازگاری نگیرید.
+نسخهٔ جدید `Code.js` در `doGet` متادیتای نسخه/پروتکل را هم برمی‌گرداند تا بررسی pre-flight بتواند ناسازگاری نسخه را تشخیص دهد. اگر deployment قدیمی باشد، باید یک‌بار دوباره deploy کنید تا هشدار ناسازگاری نگیرید.
 
 ### مرحله ۶: باز کردن پورت 8443 روی فایروال VPS
 
@@ -394,7 +394,7 @@ nano client_config.json
 
 ## افزایش ظرفیت با چند deployment (پیشنهاد می‌شود)
 
-سهمیه **~۲۰٬۰۰۰ فراخوانی در روز به ازای هر اکانت گوگل** اعمال می‌شود، نه به ازای هر deployment یا پروژه — همه deploymentهای یک اکانت از یک quota مشترک استفاده می‌کنند. کلاینت در حالت بی‌کار حدود یک بار در ثانیه poll می‌کند، اما اپ‌های real-time مثل **تلگرام یا X می‌توانند quota را ظرف چند ساعت تمام کنند**. برای عبور از این محدودیت، `Code.gs` را روی **اکانت‌های مختلف گوگل** deploy کنید و همه Deployment IDها را در `script_keys` بگذارید.
+سهمیه **~۲۰٬۰۰۰ فراخوانی در روز به ازای هر اکانت گوگل** اعمال می‌شود، نه به ازای هر deployment یا پروژه — همه deploymentهای یک اکانت از یک quota مشترک استفاده می‌کنند. کلاینت در حالت بی‌کار حدود یک بار در ثانیه poll می‌کند، اما اپ‌های real-time مثل **تلگرام یا X می‌توانند quota را ظرف چند ساعت تمام کنند**. برای عبور از این محدودیت، `Code.js` را روی **اکانت‌های مختلف گوگل** deploy کنید و همه Deployment IDها را در `script_keys` بگذارید.
 
 > ⚠️ **هر deployment را با اکانت گوگلی که زیرش است برچسب (`account`) بزنید.** کلاینت میزان موازی‌کاری (۴ poll worker به ازای هر «bucket») را بر اساس **برچسب‌های اکانت متمایز** تنظیم می‌کند، نه بر اساس تعداد deployment — چون per-second concurrency cap در Apps Script هم per-account است. دو deployment زیر یک اکانت در یک bucket و یک quota هستند؛ دو deployment زیر دو اکانت متفاوت = دو bucket.
 
@@ -459,9 +459,9 @@ nano client_config.json
 
 ## به‌روزرسانی forwarder در Apps Script
 
-اگر `Code.gs` را تغییر دادید — مثلاً برای تغییر IP VPS — باید در ویرایشگر Apps Script یک **deployment جدید** بسازید (Deploy → **New deployment**، نه فقط "Manage deployments"). صرفاً ذخیره کردن کد چیزی را عوض نمی‌کند؛ URL زنده `/exec` نسخه منتشرشده قبلی را سرو می‌کند. بعد از deploy جدید، `script_keys` را در `client_config.json` به‌روزرسانی کنید.
+اگر `Code.js` را تغییر دادید — مثلاً برای تغییر IP VPS — باید در ویرایشگر Apps Script یک **deployment جدید** بسازید (Deploy → **New deployment**، نه فقط "Manage deployments"). صرفاً ذخیره کردن کد چیزی را عوض نمی‌کند؛ URL زنده `/exec` نسخه منتشرشده قبلی را سرو می‌کند. بعد از deploy جدید، `script_keys` را در `client_config.json` به‌روزرسانی کنید.
 
-نسخهٔ فعلی `Code.gs` تعداد فراخوانی هر deployment را هم می‌شمارد و از طریق `doGet` در دسترس می‌گذارد. اگر deployment قدیمی دارید، یک بار deploy مجدد باعث می‌شود فیلد `script=N` در خط دوره‌ای `[stats]` کلاینت ظاهر شود (در غیر این صورت تونل بدون مشکل کار می‌کند، فقط عدد سمت اسکریپت را نمی‌بینید).
+نسخهٔ فعلی `Code.js` تعداد فراخوانی هر deployment را هم می‌شمارد و از طریق `doGet` در دسترس می‌گذارد. اگر deployment قدیمی دارید، یک بار deploy مجدد باعث می‌شود فیلد `script=N` در خط دوره‌ای `[stats]` کلاینت ظاهر شود (در غیر این صورت تونل بدون مشکل کار می‌کند، فقط عدد سمت اسکریپت را نمی‌بینید).
 
 ---
 
@@ -513,7 +513,7 @@ GooseRelayVPN/
 │   ├── baselines/                  # Committed baseline JSON files
 │   └── bench.sh                   # Build + run + compare orchestrator
 ├── apps_script/
-│   └── Code.gs                     # ~30-line dumb forwarder
+│   └── Code.js                     # ~30-line dumb forwarder
 ├── scripts/
 │   └── goose-relay.service         # systemd unit template
 ├── client_config.example.json
@@ -530,9 +530,9 @@ GooseRelayVPN/
 | Pre-flight fails: `cannot reach Apps Script` | اینترنت شما به گوگل دسترسی ندارد. `google_host` را چک کنید — یک IP دیگر از رنج 216.239.x.120 امتحان کنید. |
 | Pre-flight fails: `HTTP 204 — key mismatch` | `tunnel_key` در `client_config.json` با `server_config.json` روی VPS یکسان نیست. باید بایت‌به‌بایت برابر باشند. |
 | Pre-flight fails: `Apps Script cannot reach your VPS` | پورت 8443 روی VPS قابل دسترسی نیست. `sudo ufw allow 8443/tcp` را اجرا کنید و فایروال ارائه‌دهنده ابری را هم بررسی کنید. |
-| Log says `relay returned non-batch payload` | Apps Script به جای batch رمزشده، HTML برگردانده. سه علت رایج: (۱) deployment داخل `script_keys` زنده نیست یا **Who has access** روی `Anyone` نیست — دوباره deploy کنید (Deploy → **New deployment**) و `script_keys` را به‌روزرسانی کنید؛ (۲) deployment کنار فایل‌های دیگر در یک پروژه Apps Script موجود اضافه شده — یک پروژه **جدید** با فقط `Code.gs` بسازید و از آنجا deploy کنید؛ (۳) چند deployment زیر یک اکانت گوگل دارید و به per-second concurrency cap همان اکانت می‌خورید — entryهای `script_keys` را با `account` برچسب بزنید تا کلاینت per-account throttle کند (به [افزایش ظرفیت با چند deployment](#افزایش-ظرفیت-با-چند-deployment-پیشنهاد-میشود) مراجعه کنید). |
+| Log says `relay returned non-batch payload` | Apps Script به جای batch رمزشده، HTML برگردانده. سه علت رایج: (۱) deployment داخل `script_keys` زنده نیست یا **Who has access** روی `Anyone` نیست — دوباره deploy کنید (Deploy → **New deployment**) و `script_keys` را به‌روزرسانی کنید؛ (۲) deployment کنار فایل‌های دیگر در یک پروژه Apps Script موجود اضافه شده — یک پروژه **جدید** با فقط `Code.js` بسازید و از آنجا deploy کنید؛ (۳) چند deployment زیر یک اکانت گوگل دارید و به per-second concurrency cap همان اکانت می‌خورید — entryهای `script_keys` را با `account` برچسب بزنید تا کلاینت per-account throttle کند (به [افزایش ظرفیت با چند deployment](#افزایش-ظرفیت-با-چند-deployment-پیشنهاد-میشود) مراجعه کنید). |
 | Log says `relay returned HTTP 404 via …` | Deployment ID در کانفیگ شما با `/exec` زنده‌ای مطابقت ندارد. دوباره deploy کنید و کانفیگ را به‌روزرسانی کنید. |
-| Log says `relay returned HTTP 500 via …` | Apps Script نمی‌تواند به `VPS_URL` برسد. آدرس سرور در `Code.gs` را چک کنید، مطمئن شوید VPS بالا است و TCP/8443 ورودی باز است. `curl http://your.vps.ip:8443/healthz` باید 200 برگرداند. |
+| Log says `relay returned HTTP 500 via …` | Apps Script نمی‌تواند به `VPS_URL` برسد. آدرس سرور در `Code.js` را چک کنید، مطمئن شوید VPS بالا است و TCP/8443 ورودی باز است. `curl http://your.vps.ip:8443/healthz` باید 200 برگرداند. |
 | Log says `relay request failed via …: timeout` | اتصال fronted به گوگل fail می‌شود. یک `google_host` دیگر امتحان کنید — هر 216.239.x.120 که گوگل سرویس می‌دهد کار می‌کند. |
 | Browser hangs on every request | مطمئن شوید افزونه مرورگر روی SOCKS5 با **DNS through proxy** تنظیم شده است (نه SOCKS5 معمولی). در Firefox گزینه **Proxy DNS when using SOCKS v5** را فعال کنید. |
 | `[exit] dial X: ... timeout` در لاگ VPS | مقصد، IPهای دیتاسنتر را بلاک می‌کند یا VPS شما برای آن پورت اتصال خروجی ندارد. |
