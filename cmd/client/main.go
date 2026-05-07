@@ -131,11 +131,17 @@ const gooseBanner = `
 `
 
 func main() {
+	configPath := flag.String("config", "client_config.json", "path to client config JSON")
+	showVersion := flag.Bool("version", false, "show version and exit")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
+
 	fmt.Print(gooseBanner)
 	setupClientLogging()
-
-	configPath := flag.String("config", "client_config.json", "path to client config JSON")
-	flag.Parse()
 
 	cfg, err := config.LoadClient(*configPath)
 	if err != nil {

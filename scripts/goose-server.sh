@@ -58,6 +58,34 @@ get_latest_version() {
 
 # Function to get installed version
 get_installed_version() {
+    # 1. Try to get version from binary using -version flag
+    if [ -f "$INSTALL_DIR/$BINARY_NAME" ]; then
+        BIN_VERSION=$("$INSTALL_DIR/$BINARY_NAME" -version 2>/dev/null | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" || echo "")
+        if [ -n "$BIN_VERSION" ]; then
+            echo "$BIN_VERSION"
+            return
+        fi
+        
+        # 2. Try to get version from running server's /healthz
+        if [ -f "$INSTALL_DIR/$CONFIG_NAME" ]; then
+            PORT=$(jq -r '.server_port // 8443' "$INSTALL_DIR/$CONFIG_NAME" 2>/dev/null || echo "8443")
+            HEALTH_VERSION=$(curl -s --max-time 2 "http://127.0.0.1:$PORT/healthz" | jq -r '.version' 2>/dev/null || echo "")
+            if [[ "$HEALTH_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo "$HEALTH_VERSION"
+                return
+            fi
+        fi
+
+        # 3. Try to extract version string from binary using 'strings' (for older versions)
+        # We look for something like v1.5.0 at the end of a line
+        BIN_STRINGS_VERSION=$(strings "$INSTALL_DIR/$BINARY_NAME" | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | head -n 1 || echo "")
+        if [ -n "$BIN_STRINGS_VERSION" ]; then
+            echo "$BIN_STRINGS_VERSION"
+            return
+        fi
+    fi
+    
+    # 4. Fallback to .version file
     if [ -f "$INSTALL_DIR/.version" ]; then
         cat "$INSTALL_DIR/.version"
     else

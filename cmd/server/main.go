@@ -4,6 +4,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"strings"
@@ -16,7 +17,13 @@ var version = "dev"
 
 func main() {
 	configPath := flag.String("config", "server_config.json", "path to server config JSON")
+	showVersion := flag.Bool("version", false, "show version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return
+	}
 
 	cfg, err := config.LoadServer(*configPath)
 	if err != nil {
