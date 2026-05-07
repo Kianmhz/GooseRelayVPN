@@ -168,7 +168,7 @@ This is the free Google-side piece that hides your traffic.
 
 1. Go to [Google Apps Script](https://script.google.com/) and sign in.
 2. Click **New project**.
-3. Delete the default code and paste everything from [`apps_script/Code.gs`](apps_script/Code.gs).
+3. Delete the default code and paste everything from [`apps_script/Code.js`](apps_script/Code.js).
 4. Change this line to your VPS IP:
    ```javascript
    const VPS_URL = 'http://YOUR.VPS.IP:8443/tunnel';
@@ -178,7 +178,7 @@ This is the free Google-side piece that hides your traffic.
 7. Click **Deploy**. A dialog appears showing the **Deployment ID**. Copy that value and paste it into `script_keys`.
 8. Paste that ID into `script_keys` in `client_config.json`.
 
-> ⚠️ Every time you edit `Code.gs` you must create a **new deployment** (Deploy → **New deployment**) and update `script_keys`. Just saving the code is not enough.
+> ⚠️ Every time you edit `Code.js` you must create a **new deployment** (Deploy → **New deployment**) and update `script_keys`. Just saving the code is not enough.
 
 ### Step 6: Open port 8443 on your VPS firewall
 
@@ -392,7 +392,7 @@ By default the client listens on `127.0.0.1:1080` so only your computer can use 
 
 ## Increase capacity with multiple deployments (recommended)
 
-The **~20,000 calls/day quota applies per Google account**, not per deployment or project — all deployments under the same account share one quota pool. The client polls about once per second when idle, so a single deployment can sustain steady use, but heavy days hit the cap. Real-time apps like **Telegram or X can drain the quota within a few hours** due to constant polling. To go beyond that, deploy `Code.gs` across **different Google accounts** and put all the Deployment IDs into `script_keys`.
+The **~20,000 calls/day quota applies per Google account**, not per deployment or project — all deployments under the same account share one quota pool. The client polls about once per second when idle, so a single deployment can sustain steady use, but heavy days hit the cap. Real-time apps like **Telegram or X can drain the quota within a few hours** due to constant polling. To go beyond that, deploy `Code.js` across **different Google accounts** and put all the Deployment IDs into `script_keys`.
 
 > ⚠️ **Label every deployment with the Google account it lives under.** The client scales its concurrency (4 poll workers per "bucket") by **distinct account labels**, not by deployment count — because Apps Script's per-second concurrency cap is also per-account. Two deployments under the same account share one quota and one bucket; two deployments under different accounts give you two buckets.
 
@@ -457,9 +457,9 @@ What the client does for you automatically:
 
 ## Updating the Apps Script forwarder
 
-If you change `Code.gs` — for example to point at a new VPS IP — you must create a **new deployment** in the Apps Script editor (Deploy → **New deployment**, not just "Manage deployments"). Saving alone does nothing; the live `/exec` URL serves the published version. After redeploying, update `script_keys` in `client_config.json`.
+If you change `Code.js` — for example to point at a new VPS IP — you must create a **new deployment** in the Apps Script editor (Deploy → **New deployment**, not just "Manage deployments"). Saving alone does nothing; the live `/exec` URL serves the published version. After redeploying, update `script_keys` in `client_config.json`.
 
-The current `Code.gs` also tracks per-deployment invocation counts and exposes them via `doGet`, along with forwarder/protocol metadata used by the client's pre-flight check. If you have an older deployment, redeploying once enables the `script=N` field in the client's periodic `[stats]` line and avoids version-mismatch warnings.
+The current `Code.js` also tracks per-deployment invocation counts and exposes them via `doGet`, along with forwarder/protocol metadata used by the client's pre-flight check. If you have an older deployment, redeploying once enables the `script=N` field in the client's periodic `[stats]` line and avoids version-mismatch warnings.
 
 ---
 
@@ -511,7 +511,7 @@ GooseRelayVPN/
 │   ├── baselines/                  # Committed baseline JSON files
 │   └── bench.sh                   # Build + run + compare orchestrator
 ├── apps_script/
-│   └── Code.gs                     # ~30-line dumb forwarder
+│   └── Code.js                     # ~30-line dumb forwarder
 ├── scripts/
 │   └── goose-relay.service         # systemd unit template
 ├── client_config.example.json
@@ -530,9 +530,9 @@ GooseRelayVPN/
 | Pre-flight fails: `cannot reach Apps Script` | Your internet connection can't reach Google. Check `google_host` — try a different IP from the 216.239.x.120 range. |
 | Pre-flight fails: `HTTP 204 — key mismatch` | The `tunnel_key` in `client_config.json` doesn't match the one in `server_config.json` on the VPS. They must be byte-identical. |
 | Pre-flight fails: `Apps Script cannot reach your VPS` | Port 8443 on your VPS is not reachable. Run `sudo ufw allow 8443/tcp` on the VPS and check your cloud provider's firewall rules. |
-| Log says `relay returned non-batch payload` | Apps Script returned an HTML page instead of an encrypted batch. Three common causes: (1) the deployment in `script_keys` isn't live, or **Who has access** is not set to `Anyone` — re-deploy (Deploy → **New deployment**) and update `script_keys`; (2) the deployment was added to an existing Apps Script project alongside other files — create a **new** project with only `Code.gs` in it, then deploy from there; (3) you have multiple deployments under the same Google account and are hitting that account's per-second concurrency cap — label `script_keys` entries with their `account` so the client throttles per-account (see [Increase capacity with multiple deployments](#increase-capacity-with-multiple-deployments)). |
+| Log says `relay returned non-batch payload` | Apps Script returned an HTML page instead of an encrypted batch. Three common causes: (1) the deployment in `script_keys` isn't live, or **Who has access** is not set to `Anyone` — re-deploy (Deploy → **New deployment**) and update `script_keys`; (2) the deployment was added to an existing Apps Script project alongside other files — create a **new** project with only `Code.js` in it, then deploy from there; (3) you have multiple deployments under the same Google account and are hitting that account's per-second concurrency cap — label `script_keys` entries with their `account` so the client throttles per-account (see [Increase capacity with multiple deployments](#increase-capacity-with-multiple-deployments)). |
 | Log says `relay returned HTTP 404 via …` | The Deployment ID in your config doesn't match a live `/exec`. Re-deploy and update the config. |
-| Log says `relay returned HTTP 500 via …` | Apps Script can't reach `VPS_URL`. Check the server address in `Code.gs`, confirm the VPS is up, and confirm inbound TCP/8443 is open. `curl http://your.vps.ip:8443/healthz` should return 200. |
+| Log says `relay returned HTTP 500 via …` | Apps Script can't reach `VPS_URL`. Check the server address in `Code.js`, confirm the VPS is up, and confirm inbound TCP/8443 is open. `curl http://your.vps.ip:8443/healthz` should return 200. |
 | Log says `relay request failed via …: timeout` | Fronted connection to Google is failing. Try a different `google_host` — any 216.239.x.120 served by Google works. |
 | Browser hangs on every request | Make sure your browser extension uses SOCKS5 with **DNS through proxy** enabled (not plain SOCKS5). In Firefox, check **Proxy DNS when using SOCKS v5**. |
 | `[exit] dial X: ... timeout` on the VPS server logs | The target host blocks datacenter IPs, or your VPS has no outbound connectivity for that port. |
