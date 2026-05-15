@@ -4,20 +4,37 @@
   "socks_port": 1080,
   "google_host": "216.239.38.120",
   "sni": ["www.google.com", "mail.google.com", "accounts.google.com"],
+  "transport_mode": "auto",
+  "_comment_direct_stream": "Optional: only fill this if your VPS /stream endpoint is directly reachable. Leave empty for Apps Script-only mode.",
+  "direct_stream_urls": [],
+  "_comment_script_keys": "Add more entries here for extra deployments/accounts, e.g. {\"id\":\"AKfycb...\",\"account\":\"acct-b\"}. Deployments with the same account label share one Apps Script daily quota bucket.",
   "script_keys": [
-    {"id": "REPLACE_WITH_DEPLOYMENT_ID", "account": "acct-a"},
-    {"id": "OPTIONAL_SECOND_DEPLOYMENT_ID", "account": "acct-a"},
-    {"id": "OPTIONAL_THIRD_DEPLOYMENT_ID", "account": "acct-b"}
+    {"id": "REPLACE_WITH_DEPLOYMENT_ID", "account": "acct-a"}
   ],
-  "tunnel_key": "REPLACE_WITH_OUTPUT_OF_scripts_gen-key.sh",
+  "tunnel_key": "REPLACE_WITH_64_HEX_CHARACTER_RANDOM_KEY",
 
   "_comment_socks_auth": "Optional: require SOCKS5 username/password (RFC 1929). Both fields must be set together or both omitted.",
   "socks_user": "",
   "socks_pass": "",
 
+  "_comment_performance": "Optional speed profile: balanced, latency, or throughput. Explicit knobs below override the profile.",
+  "performance_mode": "latency",
+  "auto_tune": false,
+
   "_comment_coalesce": "Optional: adaptive uplink coalescing. Set coalesce_step_ms to a positive number to make a burst of TX operations wait a little for more operations before sending, which reduces Apps Script calls. A good starting range is 20-40 ms. Set it to 0 to turn coalescing off.",
   "coalesce_step_ms": 0,
 
   "_comment_idle_slots": "Optional download-throughput tuning. Default 1 (safe). Raise to 2 if each account has 2+ deployments — this may increase download throughput; leave at 1 for accounts with one deployment. Max 3. Omitting the field is equivalent to 1.",
-  "idle_slots_per_bucket": 1
+  "idle_slots_per_bucket": 1,
+
+  "_comment_advanced_performance": "Advanced: leave these defaults unless measuring. Lower poll_idle_sleep_ms can reduce latency; more workers/idle slots can increase throughput but raise request volume.",
+  "workers_per_endpoint": 4,
+  "poll_idle_sleep_ms": 5,
+  "endpoint_blacklist_base_ms": 3000,
+  "endpoint_blacklist_max_ms": 3600000,
+  "endpoint_outage_grace_ms": 60000,
+  "max_request_bytes_pre_encode": 8388608,
+  "stream_connect_timeout_ms": 5000,
+  "stream_ping_interval_ms": 20000,
+  "stream_reconnect_backoff_ms": 1000
 }

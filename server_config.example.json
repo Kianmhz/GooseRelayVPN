@@ -2,6 +2,17 @@
   "server_host": "0.0.0.0",
   "server_port": 8443,
   "tunnel_key": "SAME_VALUE_AS_CLIENT_tunnel_key",
-  "upstream_proxy": "OPTIONAL_socks5://127.0.0.1:40000",
-  "debug_timing": false
+  "_comment_upstream_proxy": "Optional: set to socks5://127.0.0.1:40000 only after installing and connecting Cloudflare WARP or another local SOCKS5 proxy on the VPS. Leave empty otherwise.",
+  "upstream_proxy": "",
+  "debug_timing": false,
+  "auto_tune": false,
+  "performance_mode": "latency",
+  "active_drain_window_ms": 150,
+  "long_poll_window_ms": 6000,
+  "upstream_dial_timeout_ms": 8000,
+  "coalesce_window_ms": 0,
+  "coalesce_window_busy_ms": 0,
+  "max_sessions": 4096,
+  "max_request_body_bytes": 12582912,
+  "max_response_bytes_pre_encode": 23068672
 }
