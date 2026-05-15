@@ -11,14 +11,26 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/kianmhz/GooseRelayVPN/internal/protocol"
 )
 
 // Server is the VPS exit server config.
 type Server struct {
-	ListenAddr    string
-	AESKeyHex     string
-	DebugTiming   bool
-	UpstreamProxy string // optional socks5://host:port; when set, all outbound dials go through this proxy
+	ListenAddr                string
+	AESKeyHex                 string
+	DebugTiming               bool
+	AutoTune                  bool
+	UpstreamProxy             string // optional socks5://host:port; when set, all outbound dials go through this proxy
+	PerformanceMode           string
+	ActiveDrainWindowMs       int
+	LongPollWindowMs          int
+	UpstreamDialTimeoutMs     int
+	CoalesceWindowMs          int
+	CoalesceWindowBusyMs      int
+	MaxSessions               int
+	MaxRequestBodyBytes       int
+	MaxResponseBytesPreEncode int
 }
 
 type serverFile struct {
@@ -30,11 +42,22 @@ type serverFile struct {
 	// Optional: when true, log per-session dial breakdown (DNS, TCP, first
 	// upstream read) so an operator can pinpoint where latency is going.
 	DebugTiming bool `json:"debug_timing"`
+	AutoTune    bool `json:"auto_tune"`
 
 	// Optional: route all outbound connections through a local SOCKS5 proxy
 	// (e.g. Cloudflare WARP on socks5://127.0.0.1:40000). Useful when the VPS
 	// datacenter IP is blocked by certain sites.
 	UpstreamProxy string `json:"upstream_proxy"`
+
+	PerformanceMode           string `json:"performance_mode"`
+	ActiveDrainWindowMs       int    `json:"active_drain_window_ms"`
+	LongPollWindowMs          int    `json:"long_poll_window_ms"`
+	UpstreamDialTimeoutMs     int    `json:"upstream_dial_timeout_ms"`
+	CoalesceWindowMs          int    `json:"coalesce_window_ms"`
+	CoalesceWindowBusyMs      int    `json:"coalesce_window_busy_ms"`
+	MaxSessions               int    `json:"max_sessions"`
+	MaxRequestBodyBytes       int    `json:"max_request_body_bytes"`
+	MaxResponseBytesPreEncode int    `json:"max_response_bytes_pre_encode"`
 
 	// Legacy keys kept as fallback for existing deployments.
 	ListenAddr string `json:"listen_addr"`
@@ -105,11 +128,91 @@ func LoadServer(path string) (*Server, error) {
 		upstreamProxy = u.Host
 	}
 
+	performanceMode, err := normalizePerformanceMode(f.PerformanceMode)
+	if err != nil {
+		return nil, err
+	}
+	activeDrainWindowMs := f.ActiveDrainWindowMs
+	longPollWindowMs := f.LongPollWindowMs
+	upstreamDialTimeoutMs := f.UpstreamDialTimeoutMs
+	coalesceWindowMs := f.CoalesceWindowMs
+	coalesceWindowBusyMs := f.CoalesceWindowBusyMs
+	maxSessions := f.MaxSessions
+	maxRequestBodyBytes := f.MaxRequestBodyBytes
+	maxResponseBytesPreEncode := f.MaxResponseBytesPreEncode
+	switch performanceMode {
+	case "latency":
+		if activeDrainWindowMs == 0 {
+			activeDrainWindowMs = protocol.LatencyActiveDrainWindowMs
+		}
+		if longPollWindowMs == 0 {
+			longPollWindowMs = protocol.LatencyLongPollWindowMs
+		}
+		if upstreamDialTimeoutMs == 0 {
+			upstreamDialTimeoutMs = protocol.LatencyUpstreamDialTimeoutMs
+		}
+	case "throughput":
+		if coalesceWindowMs == 0 {
+			coalesceWindowMs = protocol.ThroughputCoalesceWindowMs
+		}
+		if coalesceWindowBusyMs == 0 {
+			coalesceWindowBusyMs = protocol.ThroughputCoalesceWindowBusyMs
+		}
+	}
+	if activeDrainWindowMs == 0 {
+		activeDrainWindowMs = protocol.DefaultActiveDrainWindowMs
+	}
+	if longPollWindowMs == 0 {
+		longPollWindowMs = protocol.DefaultLongPollWindowMs
+	}
+	if upstreamDialTimeoutMs == 0 {
+		upstreamDialTimeoutMs = protocol.DefaultUpstreamDialTimeoutMs
+	}
+	if performanceMode != "latency" {
+		if coalesceWindowMs == 0 {
+			coalesceWindowMs = protocol.DefaultCoalesceWindowMs
+		}
+		if coalesceWindowBusyMs == 0 {
+			coalesceWindowBusyMs = protocol.DefaultCoalesceWindowBusyMs
+		}
+	}
+	if maxResponseBytesPreEncode == 0 {
+		maxResponseBytesPreEncode = protocol.MaxResponseBytesPreEncode
+	}
+	if maxRequestBodyBytes == 0 {
+		maxRequestBodyBytes = protocol.MaxRequestBodyBytes
+	}
+	if maxSessions == 0 {
+		maxSessions = protocol.DefaultMaxServerSessions
+	}
+	if activeDrainWindowMs < 1 || longPollWindowMs < 1 || upstreamDialTimeoutMs < 1 || coalesceWindowMs < 0 || coalesceWindowBusyMs < 0 {
+		return nil, fmt.Errorf("performance timing values must be positive durations, except coalesce windows may be 0 in %s", path)
+	}
+	if maxResponseBytesPreEncode < protocol.MaxFramePayload {
+		return nil, fmt.Errorf("max_response_bytes_pre_encode must be at least %d in %s", protocol.MaxFramePayload, path)
+	}
+	if maxRequestBodyBytes < protocol.MaxFramePayload {
+		return nil, fmt.Errorf("max_request_body_bytes must be at least %d in %s", protocol.MaxFramePayload, path)
+	}
+	if maxSessions < 1 {
+		return nil, fmt.Errorf("max_sessions must be at least 1 in %s", path)
+	}
+
 	c := Server{
-		ListenAddr:    net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
-		AESKeyHex:     key,
-		DebugTiming:   f.DebugTiming,
-		UpstreamProxy: upstreamProxy,
+		ListenAddr:                net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
+		AESKeyHex:                 key,
+		DebugTiming:               f.DebugTiming,
+		AutoTune:                  f.AutoTune,
+		UpstreamProxy:             upstreamProxy,
+		PerformanceMode:           performanceMode,
+		ActiveDrainWindowMs:       activeDrainWindowMs,
+		LongPollWindowMs:          longPollWindowMs,
+		UpstreamDialTimeoutMs:     upstreamDialTimeoutMs,
+		CoalesceWindowMs:          coalesceWindowMs,
+		CoalesceWindowBusyMs:      coalesceWindowBusyMs,
+		MaxSessions:               maxSessions,
+		MaxRequestBodyBytes:       maxRequestBodyBytes,
+		MaxResponseBytesPreEncode: maxResponseBytesPreEncode,
 	}
 	return &c, nil
 }

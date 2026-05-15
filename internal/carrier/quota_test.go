@@ -27,6 +27,33 @@ func TestNextQuotaReset_AdvancesAcrossMidnightPacific(t *testing.T) {
 	}
 }
 
+func TestNextQuotaReset_HandlesPacificDSTTransitions(t *testing.T) {
+	if quotaResetTZ.String() != "America/Los_Angeles" {
+		t.Skip("system tzdata unavailable; fixed-zone fallback intentionally cannot model DST")
+	}
+	loc := quotaResetTZ
+
+	springNow := time.Date(2026, 3, 8, 1, 30, 0, 0, loc)
+	springReset := nextQuotaReset(springNow)
+	wantSpring := time.Date(2026, 3, 9, 0, 0, 0, 0, loc)
+	if !springReset.Equal(wantSpring) {
+		t.Fatalf("spring reset = %v, want %v", springReset, wantSpring)
+	}
+	if _, offset := springReset.In(loc).Zone(); offset != -7*3600 {
+		t.Fatalf("spring reset offset = %d, want PDT (-7h)", offset)
+	}
+
+	fallNow := time.Date(2026, 11, 1, 1, 30, 0, 0, loc)
+	fallReset := nextQuotaReset(fallNow)
+	wantFall := time.Date(2026, 11, 2, 0, 0, 0, 0, loc)
+	if !fallReset.Equal(wantFall) {
+		t.Fatalf("fall reset = %v, want %v", fallReset, wantFall)
+	}
+	if _, offset := fallReset.In(loc).Zone(); offset != -8*3600 {
+		t.Fatalf("fall reset offset = %d, want PST (-8h)", offset)
+	}
+}
+
 func TestBumpDailyCount_RollsOverAtReset(t *testing.T) {
 	c := &Client{endpoints: []relayEndpoint{{url: "u1"}}}
 
@@ -45,6 +72,43 @@ func TestBumpDailyCount_RollsOverAtReset(t *testing.T) {
 	}
 	if !c.endpoints[0].dailyResetAt.After(time.Now()) {
 		t.Fatalf("dailyResetAt should advance to a future instant after rollover")
+	}
+}
+
+func TestTouchDailyWindowClearsQuotaBlacklistAtReset(t *testing.T) {
+	loc := quotaResetTZ
+	reset := time.Date(2026, 5, 15, 0, 0, 0, 0, loc)
+	c := &Client{endpoints: []relayEndpoint{{
+		dailyCount:          123,
+		dailyResetAt:        reset,
+		quotaExhaustedUntil: reset,
+		blacklistedTill:     reset,
+	}}}
+
+	if !c.touchDailyWindow(&c.endpoints[0], reset.Add(time.Second)) {
+		t.Fatal("expected rollover")
+	}
+	if !c.endpoints[0].blacklistedTill.IsZero() {
+		t.Fatalf("blacklistedTill = %v, want cleared on quota reset", c.endpoints[0].blacklistedTill)
+	}
+}
+
+func TestTouchDailyWindowKeepsFutureNonQuotaBlacklist(t *testing.T) {
+	loc := quotaResetTZ
+	reset := time.Date(2026, 5, 15, 0, 0, 0, 0, loc)
+	futureBlacklist := reset.Add(30 * time.Minute)
+	c := &Client{endpoints: []relayEndpoint{{
+		dailyCount:          123,
+		dailyResetAt:        reset,
+		quotaExhaustedUntil: reset,
+		blacklistedTill:     futureBlacklist,
+	}}}
+
+	if !c.touchDailyWindow(&c.endpoints[0], reset.Add(time.Second)) {
+		t.Fatal("expected rollover")
+	}
+	if !c.endpoints[0].blacklistedTill.Equal(futureBlacklist) {
+		t.Fatalf("blacklistedTill = %v, want future non-quota blacklist preserved", c.endpoints[0].blacklistedTill)
 	}
 }
 

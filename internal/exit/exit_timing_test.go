@@ -2,6 +2,7 @@ package exit
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -9,12 +10,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/kianmhz/GooseRelayVPN/internal/frame"
+	"github.com/kianmhz/GooseRelayVPN/internal/protocol"
 	"github.com/kianmhz/GooseRelayVPN/internal/session"
 )
 
@@ -36,6 +40,472 @@ func mustExitTimingCrypto(tb testing.TB) *frame.Crypto {
 		tb.Fatalf("new crypto: %v", err)
 	}
 	return c
+}
+
+func TestExit_AdvancedPerformanceConfigResolvesRuntimeKnobs(t *testing.T) {
+	s, err := New(Config{
+		ListenAddr:                "127.0.0.1:0",
+		AESKeyHex:                 exitTimingTestKeyHex,
+		MaxSessions:               123,
+		ActiveDrainWindow:         25 * time.Millisecond,
+		LongPollWindow:            75 * time.Millisecond,
+		UpstreamDialTimeout:       8 * time.Second,
+		CoalesceWindow:            5 * time.Millisecond,
+		CoalesceWindowBusy:        2 * time.Millisecond,
+		MaxRequestBodyBytes:       2 * 1024 * 1024,
+		MaxResponseBytesPreEncode: 512 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if s.activeDrainWindow != 25*time.Millisecond {
+		t.Fatalf("activeDrainWindow = %v, want 25ms", s.activeDrainWindow)
+	}
+	if s.longPollWindow != 75*time.Millisecond {
+		t.Fatalf("longPollWindow = %v, want 75ms", s.longPollWindow)
+	}
+	if s.upstreamDialTimeout != 8*time.Second {
+		t.Fatalf("upstreamDialTimeout = %v, want 8s", s.upstreamDialTimeout)
+	}
+	if s.coalesceWindow != 5*time.Millisecond {
+		t.Fatalf("coalesceWindow = %v, want 5ms", s.coalesceWindow)
+	}
+	if s.coalesceWindowBusy != 2*time.Millisecond {
+		t.Fatalf("coalesceWindowBusy = %v, want 2ms", s.coalesceWindowBusy)
+	}
+	if s.maxResponseBytesPreEncode != 512*1024 {
+		t.Fatalf("maxResponseBytesPreEncode = %d, want 512KiB", s.maxResponseBytesPreEncode)
+	}
+	if s.maxRequestBodyBytes != 2*1024*1024 {
+		t.Fatalf("maxRequestBodyBytes = %d, want 2MiB", s.maxRequestBodyBytes)
+	}
+	if s.maxSessions != 123 {
+		t.Fatalf("maxSessions = %d, want 123", s.maxSessions)
+	}
+}
+
+func TestExitHTTPServerUsesTightHeaderLimits(t *testing.T) {
+	s := mustExitTimingServer(t)
+	httpSrv := s.httpServer(http.NewServeMux())
+	if httpSrv.ReadHeaderTimeout != 3*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %v, want 3s", httpSrv.ReadHeaderTimeout)
+	}
+	if httpSrv.MaxHeaderBytes != 4096 {
+		t.Fatalf("MaxHeaderBytes = %d, want 4096", httpSrv.MaxHeaderBytes)
+	}
+}
+
+func TestExit_DisableCoalesceAllowsZeroWindows(t *testing.T) {
+	s, err := New(Config{
+		ListenAddr:      "127.0.0.1:0",
+		AESKeyHex:       exitTimingTestKeyHex,
+		DisableCoalesce: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if s.coalesceWindow != 0 || s.coalesceWindowBusy != 0 {
+		t.Fatalf("coalesce windows = %v/%v, want 0/0", s.coalesceWindow, s.coalesceWindowBusy)
+	}
+}
+
+func TestExitOpenSessionEnforcesMaxSessions(t *testing.T) {
+	s, err := New(Config{
+		ListenAddr:      "127.0.0.1:0",
+		AESKeyHex:       exitTimingTestKeyHex,
+		UpstreamProxy:   "127.0.0.1:1",
+		MaxSessions:     1,
+		DisableCoalesce: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s.dial = func(_, _ string, _ time.Duration) (net.Conn, error) {
+		a, b := net.Pipe()
+		t.Cleanup(func() {
+			_ = a.Close()
+			_ = b.Close()
+		})
+		return a, nil
+	}
+
+	var owner [frame.ClientIDLen]byte
+	owner[0] = 0x51
+	firstID := [frame.SessionIDLen]byte{0x01}
+	if _, err := s.openSession(firstID, "example.com:443", owner); err != nil {
+		t.Fatalf("first openSession: %v", err)
+	}
+	if got := s.sessionCount.Load(); got != 1 {
+		t.Fatalf("sessionCount = %d, want 1", got)
+	}
+
+	secondID := [frame.SessionIDLen]byte{0x02}
+	if _, err := s.openSession(secondID, "example.org:443", owner); !errors.Is(err, errSessionLimit) {
+		t.Fatalf("second openSession err = %v, want errSessionLimit", err)
+	}
+	if got := s.sessionCount.Load(); got != 1 {
+		t.Fatalf("sessionCount after rejected open = %d, want 1", got)
+	}
+}
+
+func TestExit_DrainAllPrioritizesFirstReplyOverOlderBulk(t *testing.T) {
+	s := mustExitTimingServer(t)
+	owner := [frame.ClientIDLen]byte{1}
+	bulkID := [frame.SessionIDLen]byte{0x0b}
+	firstReplyID := [frame.SessionIDLen]byte{0x0f}
+
+	bulk := session.New(bulkID, "bulk.example:443", false)
+	bulk.EnqueueTx([]byte("bulk"))
+	firstReply := session.New(firstReplyID, "first.example:443", false)
+	firstReply.EnqueueTx([]byte("first"))
+
+	s.mu.Lock()
+	s.sessions[bulkID] = bulk
+	s.sessionOwners[bulkID] = owner
+	s.txReady[bulkID] = struct{}{}
+	s.lastActivity[bulkID] = time.Now().Add(-1 * time.Second)
+
+	s.sessions[firstReplyID] = firstReply
+	s.sessionOwners[firstReplyID] = owner
+	s.txReady[firstReplyID] = struct{}{}
+	s.firstReply[firstReplyID] = struct{}{}
+	s.lastActivity[firstReplyID] = time.Now()
+	s.mu.Unlock()
+
+	frames, urgent := s.drainAll(owner, 1024)
+	if !urgent {
+		t.Fatalf("drainAll urgent = false, want true for first reply")
+	}
+	if len(frames) < 2 {
+		t.Fatalf("drainAll returned %d frames, want at least 2", len(frames))
+	}
+	if frames[0].SessionID != firstReplyID {
+		t.Fatalf("first drained session = %x, want first-reply session %x", frames[0].SessionID[:], firstReplyID[:])
+	}
+}
+
+func TestExit_AbortDownstreamSessionsQueuesRSTForAffectedOwner(t *testing.T) {
+	s := mustExitTimingServer(t)
+	owner := [frame.ClientIDLen]byte{1}
+	otherOwner := [frame.ClientIDLen]byte{2}
+	affectedID := [frame.SessionIDLen]byte{0xaa}
+	untouchedID := [frame.SessionIDLen]byte{0xbb}
+
+	affected := session.New(affectedID, "affected.example:443", false)
+	affected.EnqueueTx([]byte("affected"))
+	untouched := session.New(untouchedID, "untouched.example:443", false)
+	untouched.EnqueueTx([]byte("untouched"))
+
+	s.mu.Lock()
+	s.sessions[affectedID] = affected
+	s.sessionOwners[affectedID] = owner
+	s.txReady[affectedID] = struct{}{}
+	s.lastActivity[affectedID] = time.Now()
+	s.sessions[untouchedID] = untouched
+	s.sessionOwners[untouchedID] = otherOwner
+	s.txReady[untouchedID] = struct{}{}
+	s.lastActivity[untouchedID] = time.Now()
+	s.mu.Unlock()
+
+	if n := s.abortDownstreamSessions(owner, [][frame.SessionIDLen]byte{affectedID, untouchedID}, "test abort"); n != 1 {
+		t.Fatalf("abortDownstreamSessions reset %d sessions, want 1", n)
+	}
+
+	s.mu.Lock()
+	_, affectedPresent := s.sessions[affectedID]
+	_, affectedReady := s.txReady[affectedID]
+	_, untouchedPresent := s.sessions[untouchedID]
+	_, untouchedReady := s.txReady[untouchedID]
+	rsts := append([]*frame.Frame(nil), s.pendingRSTs[owner]...)
+	s.mu.Unlock()
+
+	if affectedPresent || affectedReady {
+		t.Fatal("affected session still present in server maps")
+	}
+	if !untouchedPresent || !untouchedReady {
+		t.Fatal("session owned by another client was removed")
+	}
+	if len(rsts) != 1 || rsts[0].SessionID != affectedID || !rsts[0].HasFlag(frame.FlagRST) {
+		t.Fatalf("pending RSTs = %#v, want one RST for affected session", rsts)
+	}
+}
+
+func TestReadTunnelRequestBodyRejectsOverLimit(t *testing.T) {
+	_, err := readTunnelRequestBody(bytes.NewReader([]byte("abcdef")), -1, 5)
+	if err == nil {
+		t.Fatal("readTunnelRequestBody succeeded for over-limit body")
+	}
+}
+
+func TestReadTunnelRequestBodyRejectsLargeContentLengthBeforeReading(t *testing.T) {
+	_, err := readTunnelRequestBody(errReader{}, 6, 5)
+	if !errors.Is(err, errRequestTooLarge) {
+		t.Fatalf("readTunnelRequestBody err = %v, want errRequestTooLarge", err)
+	}
+}
+
+func TestReadTunnelRequestBodyAllowsLimitSizedBody(t *testing.T) {
+	got, err := readTunnelRequestBody(bytes.NewReader([]byte("abcde")), int64(len("abcde")), 5)
+	if err != nil {
+		t.Fatalf("readTunnelRequestBody: %v", err)
+	}
+	if string(got) != "abcde" {
+		t.Fatalf("got %q, want abcde", got)
+	}
+}
+
+func TestHandleTunnelSetsContentLength(t *testing.T) {
+	s, err := New(Config{
+		ListenAddr:         "127.0.0.1:0",
+		AESKeyHex:          exitTimingTestKeyHex,
+		LongPollWindow:     time.Millisecond,
+		CoalesceWindow:     -1,
+		CoalesceWindowBusy: -1,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	var clientID [frame.ClientIDLen]byte
+	body, err := frame.EncodeBatch(s.aead, clientID, nil)
+	if err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/tunnel", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+
+	s.handleTunnel(rr, req)
+
+	resp := rr.Result()
+	defer resp.Body.Close()
+	got := resp.Header.Get("Content-Length")
+	want := strconv.Itoa(rr.Body.Len())
+	if got != want {
+		t.Fatalf("Content-Length = %q, want %q", got, want)
+	}
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) {
+	return 0, errors.New("reader should not be touched")
+}
+
+func TestExit_RequestBodyLimitIndependentFromResponseBudget(t *testing.T) {
+	s, err := New(Config{
+		ListenAddr:                "127.0.0.1:0",
+		AESKeyHex:                 exitTimingTestKeyHex,
+		MaxRequestBodyBytes:       protocol.MaxFramePayload + 1024,
+		MaxResponseBytesPreEncode: protocol.MaxFramePayload,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	body := bytes.Repeat([]byte("x"), protocol.MaxFramePayload+1)
+	req := httptest.NewRequest(http.MethodPost, "/tunnel", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleTunnel(rec, req)
+
+	if rec.Code == http.StatusBadRequest {
+		t.Fatalf("request was rejected by response budget; want body read to use maxRequestBodyBytes=%d", s.maxRequestBodyBytes)
+	}
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want decode failure HTTP 204 after body read succeeds", rec.Code)
+	}
+}
+
+func TestExit_DirectBinaryRequestGetsBinaryResponse(t *testing.T) {
+	s := mustExitTimingServer(t)
+	c := mustExitTimingCrypto(t)
+
+	var clientID [frame.ClientIDLen]byte
+	clientID[0] = 0x42
+	body, err := frame.EncodeBatchBinary(c, clientID, nil)
+	if err != nil {
+		t.Fatalf("encode binary: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/tunnel", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	rec := httptest.NewRecorder()
+
+	s.handleTunnel(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Content-Type"); got != "application/octet-stream" {
+		t.Fatalf("Content-Type = %q, want application/octet-stream", got)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	gotClient, frames, err := frame.DecodeBatchBinary(c, respBody)
+	if err != nil {
+		t.Fatalf("decode binary response: %v", err)
+	}
+	if gotClient != clientID {
+		t.Fatalf("clientID mismatch: got %x want %x", gotClient, clientID)
+	}
+	if len(frames) != 0 {
+		t.Fatalf("frames = %d, want 0", len(frames))
+	}
+}
+
+func TestExit_StreamVersionProbeReturnsBinaryBatch(t *testing.T) {
+	s := mustExitTimingServer(t)
+	c := mustExitTimingCrypto(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream", s.handleStream)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/stream", nil)
+	if err != nil {
+		t.Fatalf("dial stream: %v", err)
+	}
+	defer conn.CloseNow()
+
+	clientID := [frame.ClientIDLen]byte{0x55}
+	sessionID := [frame.SessionIDLen]byte{0x77}
+	body, err := frame.EncodeBatchBinary(c, clientID, []*frame.Frame{{
+		SessionID: sessionID,
+		Flags:     frame.FlagACK,
+		Payload:   protocol.EncodeProbePayload("test-client"),
+	}})
+	if err != nil {
+		t.Fatalf("encode probe: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, body); err != nil {
+		t.Fatalf("write probe: %v", err)
+	}
+
+	typ, respBody, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	if typ != websocket.MessageBinary {
+		t.Fatalf("message type = %v, want binary", typ)
+	}
+	gotClient, frames, err := frame.DecodeBatchBinary(c, respBody)
+	if err != nil {
+		t.Fatalf("decode stream response: %v", err)
+	}
+	if gotClient != clientID {
+		t.Fatalf("clientID = %x, want %x", gotClient, clientID)
+	}
+	if len(frames) != 1 || !frames[0].HasFlag(frame.FlagRST) {
+		t.Fatalf("frames = %#v, want one RST version response", frames)
+	}
+	info, err := protocol.DecodeVersionInfo(frames[0].Payload)
+	if err != nil || !info.OK {
+		t.Fatalf("version payload decode = %#v, %v", info, err)
+	}
+}
+
+func TestExit_StreamRoundTripToUpstream(t *testing.T) {
+	s := mustExitTimingServer(t)
+	c := mustExitTimingCrypto(t)
+	upstream, closeUpstream := startMarkerServer(t, []byte("stream-upstream"), 0)
+	defer closeUpstream()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream", s.handleStream)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/stream", nil)
+	if err != nil {
+		t.Fatalf("dial stream: %v", err)
+	}
+	defer conn.CloseNow()
+
+	clientID := [frame.ClientIDLen]byte{0x56}
+	sessionID := [frame.SessionIDLen]byte{0x78}
+	body, err := frame.EncodeBatchBinary(c, clientID, []*frame.Frame{{
+		SessionID: sessionID,
+		Flags:     frame.FlagSYN,
+		Target:    upstream,
+	}})
+	if err != nil {
+		t.Fatalf("encode syn: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, body); err != nil {
+		t.Fatalf("write syn: %v", err)
+	}
+
+	typ, respBody, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	if typ != websocket.MessageBinary {
+		t.Fatalf("message type = %v, want binary", typ)
+	}
+	gotClient, frames, err := frame.DecodeBatchBinary(c, respBody)
+	if err != nil {
+		t.Fatalf("decode stream response: %v", err)
+	}
+	if gotClient != clientID {
+		t.Fatalf("clientID = %x, want %x", gotClient, clientID)
+	}
+	if len(frames) == 0 {
+		t.Fatal("stream response contained no frames")
+	}
+	if frames[0].SessionID != sessionID || string(frames[0].Payload) != "stream-upstream" {
+		t.Fatalf("frame = session %x payload %q, want session %x payload stream-upstream",
+			frames[0].SessionID[:4], frames[0].Payload, sessionID[:4])
+	}
+}
+
+func TestExit_StreamDisconnectKeepsSessionsDuringReconnectGrace(t *testing.T) {
+	s := mustExitTimingServer(t)
+	c := mustExitTimingCrypto(t)
+	upstream, closeUpstream := startMarkerServer(t, []byte("stream-upstream"), 0)
+	defer closeUpstream()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream", s.handleStream)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/stream", nil)
+	if err != nil {
+		t.Fatalf("dial stream: %v", err)
+	}
+
+	clientID := [frame.ClientIDLen]byte{0x57}
+	sessionID := [frame.SessionIDLen]byte{0x79}
+	body, err := frame.EncodeBatchBinary(c, clientID, []*frame.Frame{{
+		SessionID: sessionID,
+		Flags:     frame.FlagSYN,
+		Target:    upstream,
+	}})
+	if err != nil {
+		t.Fatalf("encode syn: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, body); err != nil {
+		t.Fatalf("write syn: %v", err)
+	}
+	if _, _, err := conn.Read(ctx); err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	if err := conn.Close(websocket.StatusNormalClosure, "test done"); err != nil {
+		t.Fatalf("close stream: %v", err)
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		_, alive := s.sessions[sessionID]
+		s.mu.Unlock()
+		if !alive {
+			t.Fatal("stream-owned session was aborted before reconnect grace elapsed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func invokeExitTunnel(tb testing.TB, s *Server, c *frame.Crypto, frames []*frame.Frame) time.Duration {
@@ -341,9 +811,9 @@ func TestExit_SYNDialsRunInParallel(t *testing.T) {
 
 	clientID := [frame.ClientIDLen]byte{0xCC}
 	frames := []*frame.Frame{
-		{SessionID: [frame.SessionIDLen]byte{0xA1}, Flags: frame.FlagSYN, Target: "a.example:443"},
-		{SessionID: [frame.SessionIDLen]byte{0xB2}, Flags: frame.FlagSYN, Target: "b.example:443"},
-		{SessionID: [frame.SessionIDLen]byte{0xC3}, Flags: frame.FlagSYN, Target: "c.example:443"},
+		{SessionID: [frame.SessionIDLen]byte{0xA1}, Flags: frame.FlagSYN, Target: "127.0.0.1:10001"},
+		{SessionID: [frame.SessionIDLen]byte{0xB2}, Flags: frame.FlagSYN, Target: "127.0.0.1:10002"},
+		{SessionID: [frame.SessionIDLen]byte{0xC3}, Flags: frame.FlagSYN, Target: "127.0.0.1:10003"},
 	}
 
 	muteLogsForBench(t)
@@ -362,6 +832,68 @@ func TestExit_SYNDialsRunInParallel(t *testing.T) {
 	if elapsed > dialDelay+ActiveDrainWindow+250*time.Millisecond {
 		t.Fatalf("3 SYNs dispatched serially: elapsed=%v (expected ~%v in parallel)",
 			elapsed, dialDelay+ActiveDrainWindow)
+	}
+}
+
+func TestExit_StreamSYNDialsRunInParallel(t *testing.T) {
+	s := mustExitTimingServer(t)
+	c := mustExitTimingCrypto(t)
+
+	const dialDelay = 600 * time.Millisecond
+	done := make(chan struct{})
+	var (
+		mu        sync.Mutex
+		dialCount int
+	)
+	s.dial = func(_, addr string, _ time.Duration) (net.Conn, error) {
+		time.Sleep(dialDelay)
+		mu.Lock()
+		dialCount++
+		if dialCount == 3 {
+			close(done)
+		}
+		mu.Unlock()
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errSimulatedDialFail{}}
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream", s.handleStream)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/stream", nil)
+	if err != nil {
+		t.Fatalf("dial stream: %v", err)
+	}
+	defer conn.CloseNow()
+
+	clientID := [frame.ClientIDLen]byte{0xCD}
+	frames := []*frame.Frame{
+		{SessionID: [frame.SessionIDLen]byte{0xA1}, Flags: frame.FlagSYN, Target: "127.0.0.1:10101"},
+		{SessionID: [frame.SessionIDLen]byte{0xB2}, Flags: frame.FlagSYN, Target: "127.0.0.1:10102"},
+		{SessionID: [frame.SessionIDLen]byte{0xC3}, Flags: frame.FlagSYN, Target: "127.0.0.1:10103"},
+	}
+	body, err := frame.EncodeBatchBinary(c, clientID, frames)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	muteLogsForBench(t)
+	t0 := time.Now()
+	if err := conn.Write(ctx, websocket.MessageBinary, body); err != nil {
+		t.Fatalf("write stream: %v", err)
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for stream SYN dials: %v", ctx.Err())
+	}
+	elapsed := time.Since(t0)
+	if elapsed > dialDelay+250*time.Millisecond {
+		t.Fatalf("stream SYN dials dispatched serially: elapsed=%v (expected ~%v in parallel)",
+			elapsed, dialDelay)
 	}
 }
 

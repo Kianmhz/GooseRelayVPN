@@ -171,7 +171,7 @@ This is the free Google-side piece that hides your traffic.
 3. Delete the default code and paste everything from [`apps_script/Code.gs`](apps_script/Code.gs).
 4. Change this line to your VPS IP:
    ```javascript
-   const VPS_URL = 'http://YOUR.VPS.IP:8443/tunnel';
+   const RELAY_URLS = ['http://YOUR.VPS.IP:8443/tunnel'];
    ```
 5. Click **Deploy → New deployment** → set type to **Web app**.
 6. Set **Execute as:** Me and **Who has access:** Anyone.
@@ -261,6 +261,7 @@ Paste this (adjust the path if your binary is in a different location):
 [Unit]
 Description=GooseRelayVPN exit server
 After=network.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -270,6 +271,16 @@ Restart=always
 RestartSec=3
 StandardOutput=journal
 StandardError=journal
+LimitNOFILE=1048576
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -426,6 +437,24 @@ What the client does for you automatically:
 
 ---
 
+## Direct Stream Mode
+
+For the lowest latency direct-to-VPS path, add `direct_stream_urls` to `client_config.json` and keep `transport_mode` at `auto`:
+
+```json
+{
+  "transport_mode": "auto",
+  "direct_stream_urls": ["wss://YOUR.VPS.DOMAIN:8443/stream"],
+  "script_keys": ["APPS_SCRIPT_FALLBACK_DEPLOYMENT_ID"]
+}
+```
+
+`auto` tries the WebSocket `/stream` endpoint first, then direct binary POST via `relay_urls` if configured, then Apps Script. Use `direct_stream`, `direct_post`, or `apps_script` to force one path. Apps Script cannot carry WebSockets; it remains the compatibility fallback.
+
+Optional stream knobs are `stream_connect_timeout_ms` (default `5000`), `stream_ping_interval_ms` (default `20000`), and `stream_reconnect_backoff_ms` (default `1000`). `auto_tune` can be set to `true` to let the client adjust `poll_idle_sleep_ms` inside fixed caps using observed TTFB; it never changes crypto, wire compatibility, connect timeouts, or payload limits.
+
+---
+
 ## Configuration
 
 ### Client (`client_config.json`)
@@ -435,7 +464,7 @@ What the client does for you automatically:
 | `socks_host` | `127.0.0.1` | Host/IP for the local SOCKS5 listener. Set to `0.0.0.0` for LAN sharing. |
 | `socks_port` | `1080` | Port for the local SOCKS5 listener. |
 | `google_host` | `216.239.38.120` | Google edge IP/host to dial (port is fixed to `443`). |
-| `sni` | `www.google.com` | SNI presented during the TLS handshake. Accepts a single string or an array — `["www.google.com", "mail.google.com", "accounts.google.com"]` — where each SNI host gets its own connection and throttle bucket, which can multiply available bandwidth in regions that rate-limit per domain name. |
+| `sni` | `["www.google.com", "mail.google.com", "accounts.google.com"]` | SNI presented during the TLS handshake. Accepts a single string or an array. Each SNI host gets its own connection and throttle bucket, which can multiply available bandwidth in regions that rate-limit per domain name. |
 | `script_keys` | — | Array of Apps Script deployments. Each entry can be a bare Deployment ID string or an object `{ "id": "...", "account": "..." }` labeling the Google account it's deployed under. **The `account` label is load-bearing**: the client groups deployments by account and runs 4 poll workers per *account bucket* (more if you raise `idle_slots_per_bucket`), matching Apps Script's per-account concurrency cap. Bare strings (or unlabeled objects) all collapse into one anonymous bucket — fine if every deployment is under one Google account, but if they're under multiple accounts, label them or you lose the parallelism. See [Increase capacity with multiple deployments](#increase-capacity-with-multiple-deployments). |
 | `tunnel_key` | — | 64-char hex AES-256 key. Must match the server byte-for-byte. |
 | `socks_user` | *(optional)* | SOCKS5 username (RFC 1929). When set, clients must authenticate or the connection is rejected. Must be paired with `socks_pass` — set both or neither. |
@@ -451,7 +480,10 @@ What the client does for you automatically:
 | `server_port` | `8443` | Port where the exit server listens. Must be reachable from Google's network. |
 | `tunnel_key` | — | 64-char hex AES-256 key. Must match the client. |
 | `upstream_proxy` | *(optional)* | Route all outbound connections through a local SOCKS5 proxy. Useful when your VPS datacenter IP is blocked by certain sites. Set to `socks5://127.0.0.1:40000` to use Cloudflare WARP (DNS is resolved by the proxy, so target sites see the Cloudflare IP instead of your VPS IP). Leave empty or omit to dial directly. |
+| `auto_tune` | `false` | When `true`, the server adjusts only `active_drain_window_ms` and the coalesce windows inside fixed safety caps based on downstream queue wait. It does not change `long_poll_window_ms`, dial timeouts, session limits, or body-size limits. |
+| `upstream_dial_timeout_ms` | `15000` | Exit-side TCP dial timeout for new upstream connections. Latency mode defaults this to `8000`; lower values fail dead CDN edges faster, higher values tolerate unusually slow networks. |
 | `debug_timing` | `false` | When `true`, logs per-session DNS and TCP dial latency so you can pinpoint where time is going. |
+| `max_request_body_bytes` | `12582912` | VPS HTTP request-body cap. Keep this above the client `max_request_bytes_pre_encode` because Apps Script text mode base64-expands request batches. |
 
 ---
 
@@ -459,7 +491,7 @@ What the client does for you automatically:
 
 If you change `Code.gs` — for example to point at a new VPS IP — you must create a **new deployment** in the Apps Script editor (Deploy → **New deployment**, not just "Manage deployments"). Saving alone does nothing; the live `/exec` URL serves the published version. After redeploying, update `script_keys` in `client_config.json`.
 
-The current `Code.gs` also tracks per-deployment invocation counts and exposes them via `doGet`, along with forwarder/protocol metadata used by the client's pre-flight check. If you have an older deployment, redeploying once enables the `script=N` field in the client's periodic `[stats]` line and avoids version-mismatch warnings.
+The current `Code.gs` exposes forwarder/protocol metadata via `doGet` for the client's pre-flight check. It can also expose per-deployment invocation counts when `ENABLE_INVOCATION_COUNTING` is set to `true`; counting is disabled by default because writing Apps Script properties on every tunnel request adds latency.
 
 ---
 
@@ -480,7 +512,7 @@ Key invariants:
 - **Apps Script never sees plaintext.** The script is a ~30-line forwarder; the AES key lives only on your machine and the VPS.
 - **DNS travels through the tunnel.** The SOCKS5 server uses a no-op resolver; use `socks5h://` so DNS is resolved at the exit, not locally.
 - **Long-poll, full-duplex.** The VPS holds each request open for up to 8s waiting for downstream bytes; the client runs **4 concurrent poll workers per labeled `account` bucket** in `script_keys` (default; scales further with `idle_slots_per_bucket`) — so 1 account = 4 workers, 2 accounts = 8 workers, 3 accounts = 12 workers, regardless of how many deployment IDs each account has. The bucket model exists because Apps Script's per-second concurrency cap is per-account; scaling workers by deployment count instead caused users with multiple IDs under one account to see Apps Script HTML error pages mid-session. Downstream frames are coalesced in a small (~25 ms) window so streaming workloads send fewer, larger HTTP responses.
-- **Health-aware multi-deployment.** When `script_keys` lists more than one deployment, the client picks endpoints in round-robin and exponentially blacklists any that misbehave; one same-poll retry is attempted on a fresh deployment so transient failures don't drop traffic.
+- **Health-aware multi-deployment.** When `script_keys` lists more than one deployment, the client picks endpoints by health, RTT, and quota pressure. TX batches retry across every configured endpoint before giving up, so one exhausted deployment cannot discard data while another deployment is still healthy.
 
 ### Wire format
 
@@ -532,7 +564,7 @@ GooseRelayVPN/
 | Pre-flight fails: `Apps Script cannot reach your VPS` | Port 8443 on your VPS is not reachable. Run `sudo ufw allow 8443/tcp` on the VPS and check your cloud provider's firewall rules. |
 | Log says `relay returned non-batch payload` | Apps Script returned an HTML page instead of an encrypted batch. Three common causes: (1) the deployment in `script_keys` isn't live, or **Who has access** is not set to `Anyone` — re-deploy (Deploy → **New deployment**) and update `script_keys`; (2) the deployment was added to an existing Apps Script project alongside other files — create a **new** project with only `Code.gs` in it, then deploy from there; (3) you have multiple deployments under the same Google account and are hitting that account's per-second concurrency cap — label `script_keys` entries with their `account` so the client throttles per-account (see [Increase capacity with multiple deployments](#increase-capacity-with-multiple-deployments)). |
 | Log says `relay returned HTTP 404 via …` | The Deployment ID in your config doesn't match a live `/exec`. Re-deploy and update the config. |
-| Log says `relay returned HTTP 500 via …` | Apps Script can't reach `VPS_URL`. Check the server address in `Code.gs`, confirm the VPS is up, and confirm inbound TCP/8443 is open. `curl http://your.vps.ip:8443/healthz` should return 200. |
+| Log says `relay returned HTTP 500 via …` | Apps Script can't reach a `RELAY_URLS` entry. Check the server address in `Code.gs`, confirm the VPS is up, and confirm inbound TCP/8443 is open. `curl http://your.vps.ip:8443/healthz` should return 200. |
 | Log says `relay request failed via …: timeout` | Fronted connection to Google is failing. Try a different `google_host` — any 216.239.x.120 served by Google works. |
 | Browser hangs on every request | Make sure your browser extension uses SOCKS5 with **DNS through proxy** enabled (not plain SOCKS5). In Firefox, check **Proxy DNS when using SOCKS v5**. |
 | `[exit] dial X: ... timeout` on the VPS server logs | The target host blocks datacenter IPs, or your VPS has no outbound connectivity for that port. |
@@ -541,6 +573,14 @@ GooseRelayVPN/
 | One deployment hits quota mid-session | If `script_keys` has more than one entry, the client automatically blacklists the failing one for a few seconds and keeps going on the others. With only one entry, browsing stops until the quota resets (~10:30 AM Iran time / midnight Pacific). |
 | Mismatched AES keys | Symptom: client logs no errors but no traffic flows; VPS logs no `dial ...` lines. Confirm `tunnel_key` is byte-identical in both configs. |
 
+To collect a shareable support bundle without exposing tunnel secrets, run:
+
+```bash
+./goose-client -config client_config.json -dump-diag
+```
+
+The generated `goose-diagnostics-*.zip` includes runtime, goroutine, heap, and redacted client-config data. Use `-diag-output path/to/file.zip` if you want a specific output path.
+
 ---
 
 ## Security Tips
@@ -548,7 +588,7 @@ GooseRelayVPN/
 - **Never share `client_config.json` or `server_config.json`** — the AES key is in there and a leaked key means anyone can tunnel through your VPS.
 - **Generate a fresh key with `openssl rand -hex 32`** for every deployment. Don't reuse keys across hosts.
 - **AES-GCM is the only authentication.** There's no password, no rate-limiting, no per-user accounting. Treat the key like a server-admin password.
-- **Apps Script logs every `doPost` invocation** in Google's dashboard (count and duration only — Apps Script never sees plaintext).
+- **Apps Script logs executions in Google's dashboard** (count and duration only — Apps Script never sees plaintext). The optional `ENABLE_INVOCATION_COUNTING` counter is off by default for latency.
 - **Keep `socks_host` on the client at `127.0.0.1`** unless you specifically want LAN sharing.
 - **Each Apps Script deployment is rate-limited to ~20,000 calls/day** on free Google accounts.
 
@@ -563,6 +603,13 @@ The `bench/` directory contains an end-to-end harness that spins up real `goose-
 ```bash
 # Build the binaries and run the full benchmark suite
 bash bench/bench.sh
+
+# Guard the frame/batch hot path against allocation or throughput regressions
+go test -bench 'Benchmark(Frame|EncodeBatch|DecodeBatch|SealOpen)' -benchmem ./internal/frame
+
+# Compare direct POST and direct WebSocket stream latency
+bash bench/bench.sh --smoke --scenario ttfb_p50_p95 --transport direct_post
+bash bench/bench.sh --smoke --scenario ttfb_p50_p95 --transport direct_stream
 ```
 
 The harness compares your working tree against the committed baseline in `bench/baselines/` and prints a side-by-side table. Regressions above the noise floor fail the script with exit code 1. Include the output in your PR description.

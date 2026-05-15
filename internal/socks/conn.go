@@ -71,7 +71,9 @@ func (v *VirtualConn) Write(b []byte) (int, error) {
 	if len(b) > 0 {
 		// connect_data optimization: if this is the first write for a new
 		// session and the SYN hasn't been sent yet, bundle it.
-		v.s.EnqueueInitialData(b)
+		if err := v.s.EnqueueInitialData(b); err != nil {
+			return 0, io.ErrClosedPipe
+		}
 	}
 	return len(b), nil
 }

@@ -171,7 +171,7 @@ cp server_config.example.json server_config.json
 3. کد پیش‌فرض را حذف کنید و همه محتوای [`apps_script/Code.gs`](apps_script/Code.gs) را جایگزین کنید.
 4. این خط را با IP VPS خودتان جایگزین کنید:
    ```javascript
-   const VPS_URL = 'http://YOUR.VPS.IP:8443/tunnel';
+   const RELAY_URLS = ['http://YOUR.VPS.IP:8443/tunnel'];
    ```
 5. روی **Deploy → New deployment** کلیک کنید و نوع را **Web app** بگذارید.
 6. **Execute as:** Me و **Who has access:** Anyone را انتخاب کنید.
@@ -532,7 +532,7 @@ GooseRelayVPN/
 | Pre-flight fails: `Apps Script cannot reach your VPS` | پورت 8443 روی VPS قابل دسترسی نیست. `sudo ufw allow 8443/tcp` را اجرا کنید و فایروال ارائه‌دهنده ابری را هم بررسی کنید. |
 | Log says `relay returned non-batch payload` | Apps Script به جای batch رمزشده، HTML برگردانده. سه علت رایج: (۱) deployment داخل `script_keys` زنده نیست یا **Who has access** روی `Anyone` نیست — دوباره deploy کنید (Deploy → **New deployment**) و `script_keys` را به‌روزرسانی کنید؛ (۲) deployment کنار فایل‌های دیگر در یک پروژه Apps Script موجود اضافه شده — یک پروژه **جدید** با فقط `Code.gs` بسازید و از آنجا deploy کنید؛ (۳) چند deployment زیر یک اکانت گوگل دارید و به per-second concurrency cap همان اکانت می‌خورید — entryهای `script_keys` را با `account` برچسب بزنید تا کلاینت per-account throttle کند (به [افزایش ظرفیت با چند deployment](#افزایش-ظرفیت-با-چند-deployment-پیشنهاد-میشود) مراجعه کنید). |
 | Log says `relay returned HTTP 404 via …` | Deployment ID در کانفیگ شما با `/exec` زنده‌ای مطابقت ندارد. دوباره deploy کنید و کانفیگ را به‌روزرسانی کنید. |
-| Log says `relay returned HTTP 500 via …` | Apps Script نمی‌تواند به `VPS_URL` برسد. آدرس سرور در `Code.gs` را چک کنید، مطمئن شوید VPS بالا است و TCP/8443 ورودی باز است. `curl http://your.vps.ip:8443/healthz` باید 200 برگرداند. |
+| Log says `relay returned HTTP 500 via …` | Apps Script نمی‌تواند به یکی از آدرس‌های `RELAY_URLS` برسد. آدرس سرور در `Code.gs` را چک کنید، مطمئن شوید VPS بالا است و TCP/8443 ورودی باز است. `curl http://your.vps.ip:8443/healthz` باید 200 برگرداند. |
 | Log says `relay request failed via …: timeout` | اتصال fronted به گوگل fail می‌شود. یک `google_host` دیگر امتحان کنید — هر 216.239.x.120 که گوگل سرویس می‌دهد کار می‌کند. |
 | Browser hangs on every request | مطمئن شوید افزونه مرورگر روی SOCKS5 با **DNS through proxy** تنظیم شده است (نه SOCKS5 معمولی). در Firefox گزینه **Proxy DNS when using SOCKS v5** را فعال کنید. |
 | `[exit] dial X: ... timeout` در لاگ VPS | مقصد، IPهای دیتاسنتر را بلاک می‌کند یا VPS شما برای آن پورت اتصال خروجی ندارد. |

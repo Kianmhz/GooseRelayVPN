@@ -7,6 +7,7 @@ package carrier
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -16,10 +17,33 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kianmhz/GooseRelayVPN/internal/protocol"
 	"golang.org/x/net/http2"
 )
 
 const frontedProbeOKBody = "GooseRelay forwarder OK"
+
+const (
+	frontedH2ReadIdleTimeout = 12 * time.Second
+	frontedH2PingTimeout     = 8 * time.Second
+)
+
+func NewDirectClients(pollTimeout time.Duration, workers int) []*http.Client {
+	if workers <= 0 {
+		workers = workersPerEndpoint
+	}
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		DialContext:           dialer.DialContext,
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   workers * 4,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 0,
+		DisableCompression:    true,
+	}
+	return []*http.Client{{Transport: transport, Timeout: pollTimeout}}
+}
 
 // FrontingConfig describes how to reach script.google.com without revealing
 // the real Host to a passive on-path observer: dial GoogleIP, do a TLS
@@ -176,10 +200,34 @@ func validateFrontedProbeResponse(statusCode int, body []byte) error {
 	if statusCode != http.StatusOK {
 		return fmt.Errorf("unexpected probe status %d", statusCode)
 	}
+	trimmed := bytesTrimSpaceASCII(body)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var stats scriptStatsResponse
+		if err := json.Unmarshal(trimmed, &stats); err != nil {
+			return fmt.Errorf("unexpected probe JSON: %w", err)
+		}
+		if !stats.OK {
+			return fmt.Errorf("probe JSON reported ok=false")
+		}
+		if stats.Protocol != protocol.ProtocolVersion {
+			return fmt.Errorf("probe protocol mismatch: script=%d client=%d", stats.Protocol, protocol.ProtocolVersion)
+		}
+		return nil
+	}
 	if strings.TrimSpace(string(body)) != frontedProbeOKBody {
 		return fmt.Errorf("unexpected probe body %q", strings.TrimSpace(string(body)))
 	}
 	return nil
+}
+
+func bytesTrimSpaceASCII(b []byte) []byte {
+	for len(b) > 0 && b[0] <= ' ' {
+		b = b[1:]
+	}
+	for len(b) > 0 && b[len(b)-1] <= ' ' {
+		b = b[:len(b)-1]
+	}
+	return b
 }
 
 func selectFrontedClientIndexes(results []frontedProbeResult) []int {
@@ -367,16 +415,16 @@ func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessi
 		ReadBufferSize:        64 * 1024,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		ExpectContinueTimeout: 0,
 	}
 
 	// Configure HTTP/2 so the long-lived h2 connection sends pings and detects
 	// black-holed peers quickly. Without ReadIdleTimeout, a dead h2 conn can
 	// linger until the kernel's TCP keepalive fires (~2 hours by default),
 	// leaking poll worker time as in-flight requests stall.
-	if h2t, err := http2.ConfigureTransports(transport); err == nil && h2t != nil {
-		h2t.ReadIdleTimeout = 30 * time.Second
-		h2t.PingTimeout = 15 * time.Second
+	if h2t, err := configureFrontedHTTP2(transport); err == nil && h2t != nil {
+		h2t.ReadIdleTimeout = frontedH2ReadIdleTimeout
+		h2t.PingTimeout = frontedH2PingTimeout
 		// Raise the max DATA frame size we are willing to receive from 16 KiB
 		// (spec default) to 1 MiB. Each DATA frame carries a 9-byte header,
 		// so on a long bulk download (Apps Script gateway streaming a video
@@ -388,4 +436,15 @@ func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessi
 	}
 
 	return &http.Client{Transport: transport, Timeout: pollTimeout}
+}
+
+func configureFrontedHTTP2(transport *http.Transport) (*http2.Transport, error) {
+	h2t, err := http2.ConfigureTransports(transport)
+	if err != nil || h2t == nil {
+		return h2t, err
+	}
+	h2t.ReadIdleTimeout = frontedH2ReadIdleTimeout
+	h2t.PingTimeout = frontedH2PingTimeout
+	h2t.MaxReadFrameSize = 1 << 20
+	return h2t, nil
 }

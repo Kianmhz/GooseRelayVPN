@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -21,7 +22,9 @@ import (
 //
 //	nonce (12 bytes) || ciphertext+tag (Seal output, tag is the trailing 16 bytes)
 type Crypto struct {
-	aead cipher.AEAD
+	aead         cipher.AEAD
+	nonceSalt    [12]byte
+	nonceCounter atomic.Uint64
 }
 
 // b64Encoding is the encoding used on the wire. RawStdEncoding (no '=' padding)
@@ -31,7 +34,13 @@ type Crypto struct {
 var b64Encoding = base64.RawStdEncoding
 
 // NewCryptoFromHexKey parses a 64-char hex string into a 32-byte AES-256 key
-// and constructs a Crypto. The same key must be configured on both client and VPS server.
+// and constructs a Crypto. The same key must be configured on both client and
+// VPS server.
+//
+// Nonces use a per-process 96-bit crypto/rand salt plus an atomic counter.
+// That keeps nonce reuse probability negligible even when multiple processes
+// share the same AES key; deterministic/replay-detecting nonce schemes would
+// need a different protocol.
 func NewCryptoFromHexKey(hexKey string) (*Crypto, error) {
 	key, err := hex.DecodeString(hexKey)
 	if err != nil {
@@ -48,20 +57,22 @@ func NewCryptoFromHexKey(hexKey string) (*Crypto, error) {
 	if err != nil {
 		return nil, fmt.Errorf("crypto: new gcm: %w", err)
 	}
-	return &Crypto{aead: gcm}, nil
+	c := &Crypto{aead: gcm}
+	if _, err := rand.Read(c.nonceSalt[:]); err != nil {
+		return nil, fmt.Errorf("crypto: nonce salt: %w", err)
+	}
+	return c, nil
 }
 
 // Seal encrypts plaintext and returns nonce||ciphertext (tag appended by GCM).
 func (c *Crypto) Seal(plaintext []byte) ([]byte, error) {
-	nonce := make([]byte, c.aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("crypto: nonce read: %w", err)
-	}
-	ct := c.aead.Seal(nil, nonce, plaintext, nil)
-	out := make([]byte, 0, len(nonce)+len(ct))
-	out = append(out, nonce...)
-	out = append(out, ct...)
-	return out, nil
+	ns := c.aead.NonceSize()
+	out := make([]byte, ns, ns+len(plaintext)+c.aead.Overhead())
+	nonce := out[:ns]
+	copy(nonce, c.nonceSalt[:])
+	n := c.nonceCounter.Add(1)
+	binary.BigEndian.PutUint64(nonce[ns-8:], binary.BigEndian.Uint64(nonce[ns-8:])^n)
+	return c.aead.Seal(out, nonce, plaintext, nil), nil
 }
 
 // Open inverts Seal. Returns an error on auth-tag failure (tampered ciphertext,
@@ -95,8 +106,8 @@ var (
 		buf := make([]byte, 0, 64*1024)
 		return &buf
 	}}
-	encMarshaledPool = sync.Pool{New: func() interface{} {
-		buf := make([][]byte, 0, 32)
+	decSealedPool = sync.Pool{New: func() interface{} {
+		buf := make([]byte, 0, 64*1024)
 		return &buf
 	}}
 	// zstdEncPool and zstdDecPool are used by EncodeBatch/DecodeBatch.
@@ -108,7 +119,7 @@ var (
 		return enc
 	}}
 	zstdDecPool = sync.Pool{New: func() interface{} {
-		dec, _ := zstd.NewReader(nil)
+		dec, _ := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(maxDecodedBatchPlainSize))
 		return dec
 	}}
 )
@@ -127,6 +138,12 @@ const (
 	// before compression is attempted. Tiny batches (SYN/FIN/keepalive) are
 	// unlikely to benefit.
 	compressMinSize = 512
+
+	// maxDecodedBatchPlainSize caps expanded plaintext after decompression.
+	// Batches are authenticated, but the tunnel key is also the auth boundary:
+	// a compromised or misconfigured peer should not be able to inflate one
+	// small compressed batch into unbounded memory on the other side.
+	maxDecodedBatchPlainSize = 64 * 1024 * 1024
 )
 
 // EncodeBatch packs zero or more frames into a base64-encoded HTTP body.
@@ -150,30 +167,38 @@ const (
 // not survive the hop. Sealing it under AES-GCM also means a passive observer
 // of the relay traffic cannot tell two clients apart by their IDs.
 func EncodeBatch(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame) ([]byte, error) {
+	sealed, err := encodeBatchSealed(c, clientID, frames)
+	if err != nil {
+		return nil, err
+	}
+	// Pre-size the destination so we encode directly into a []byte rather
+	// than the EncodeToString -> string -> []byte intermediate copy.
+	out := make([]byte, b64Encoding.EncodedLen(len(sealed)))
+	b64Encoding.Encode(out, sealed)
+	return out, nil
+}
+
+// EncodeBatchBinary packs frames into the same AES-GCM envelope as EncodeBatch
+// but returns raw nonce||ciphertext bytes instead of base64 text. It is only
+// safe for direct transports; Apps Script must keep using EncodeBatch.
+func EncodeBatchBinary(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame) ([]byte, error) {
+	return encodeBatchSealed(c, clientID, frames)
+}
+
+func encodeBatchSealed(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame) ([]byte, error) {
 	if len(frames) > 0xFFFF {
 		return nil, fmt.Errorf("batch: too many frames: %d", len(frames))
 	}
 
-	// Marshal all frames first so we know the exact plaintext size.
-	marshaledP := encMarshaledPool.Get().(*[][]byte)
-	marshaled := (*marshaledP)[:0]
-	defer func() {
-		for i := range marshaled {
-			marshaled[i] = nil
-		}
-		marshaled = marshaled[:0]
-		*marshaledP = marshaled
-		encMarshaledPool.Put(marshaledP)
-	}()
-
 	plainSize := 1 + ClientIDLen + 2 // flags byte + client_id + u16 frame count
 	for _, f := range frames {
-		raw, err := f.Marshal()
-		if err != nil {
-			return nil, fmt.Errorf("batch: marshal frame: %w", err)
+		if len(f.Target) > maxTargetLen {
+			return nil, fmt.Errorf("batch: marshal frame: target too long: %d > %d", len(f.Target), maxTargetLen)
 		}
-		marshaled = append(marshaled, raw)
-		plainSize += 4 + len(raw) // u32 length prefix + frame bytes
+		if len(f.Payload) > maxPayloadSize {
+			return nil, fmt.Errorf("batch: marshal frame: payload too large: %d", len(f.Payload))
+		}
+		plainSize += 4 + f.EncodedLen() // u32 length prefix + frame bytes
 	}
 
 	// Pull a plaintext scratch buffer from the pool; grow if needed.
@@ -193,10 +218,15 @@ func EncodeBatch(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame) ([]byte
 	plain = append(plain, 0x00) // flags placeholder at index 0
 	plain = append(plain, clientID[:]...)
 	plain = append(plain, byte(len(frames)>>8), byte(len(frames)))
-	for _, raw := range marshaled {
+	for _, f := range frames {
+		frameLen := f.EncodedLen()
 		plain = append(plain,
-			byte(len(raw)>>24), byte(len(raw)>>16), byte(len(raw)>>8), byte(len(raw)))
-		plain = append(plain, raw...)
+			byte(frameLen>>24), byte(frameLen>>16), byte(frameLen>>8), byte(frameLen))
+		var err error
+		plain, err = f.AppendMarshal(plain)
+		if err != nil {
+			return nil, fmt.Errorf("batch: marshal frame: %w", err)
+		}
 	}
 
 	// Attempt Zstandard compression on the payload section (everything after
@@ -205,7 +235,7 @@ func EncodeBatch(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame) ([]byte
 	// sent raw. If compression does not shrink the data (e.g. already-encrypted
 	// TLS payloads) we fall back to raw transparently.
 	sealInput := plain // default: raw, flags byte already 0x00
-	if len(plain)-1 >= compressMinSize {
+	if shouldAttemptCompression(plain[1:]) {
 		enc := zstdEncPool.Get().(*zstd.Encoder)
 		// EncodeAll appends compressed bytes to dst. The [:1:1] cap trick gives
 		// us a fresh backing array with the flags placeholder at [0], so the
@@ -226,11 +256,29 @@ func EncodeBatch(c *Crypto, clientID [ClientIDLen]byte, frames []*Frame) ([]byte
 	if err != nil {
 		return nil, fmt.Errorf("batch: seal: %w", err)
 	}
-	// Pre-size the destination so we encode directly into a []byte rather
-	// than the EncodeToString -> string -> []byte intermediate copy.
-	out := make([]byte, b64Encoding.EncodedLen(len(sealed)))
-	b64Encoding.Encode(out, sealed)
-	return out, nil
+	return sealed, nil
+}
+
+func shouldAttemptCompression(payload []byte) bool {
+	if len(payload) < compressMinSize {
+		return false
+	}
+	sample := payload
+	if len(sample) > 4096 {
+		sample = sample[:4096]
+	}
+	var seen [256]bool
+	unique := 0
+	for _, b := range sample {
+		if !seen[b] {
+			seen[b] = true
+			unique++
+		}
+	}
+	// Near-uniform byte diversity is a strong signal for encrypted/video-like
+	// data. Zstd will usually lose there, so avoid spending CPU just to fall
+	// back to raw.
+	return unique < 224
 }
 
 // DecodeBatch is the inverse of EncodeBatch. The entire batch is authenticated
@@ -253,13 +301,31 @@ func DecodeBatch(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, error) {
 	// keeps the upgrade backward-compatible: an updated client/server can
 	// still talk to a peer that hasn't been redeployed.
 	trimmed := bytes.TrimRight(bytes.TrimSpace(body), "=")
-	sealed := make([]byte, b64Encoding.DecodedLen(len(trimmed)))
+	sealedP := decSealedPool.Get().(*[]byte)
+	sealed := (*sealedP)[:0]
+	needed := b64Encoding.DecodedLen(len(trimmed))
+	if cap(sealed) < needed {
+		sealed = make([]byte, needed)
+	} else {
+		sealed = sealed[:needed]
+	}
+	defer func() {
+		sealed = sealed[:0]
+		*sealedP = sealed
+		decSealedPool.Put(sealedP)
+	}()
 	n, err := b64Encoding.Decode(sealed, trimmed)
 	if err != nil {
 		return zeroID, nil, fmt.Errorf("batch: base64 decode: %w", err)
 	}
-	sealed = sealed[:n]
+	return DecodeBatchBinary(c, sealed[:n])
+}
 
+func DecodeBatchBinary(c *Crypto, sealed []byte) ([ClientIDLen]byte, []*Frame, error) {
+	var zeroID [ClientIDLen]byte
+	if len(sealed) == 0 {
+		return zeroID, nil, nil
+	}
 	rawPlain, err := c.Open(sealed)
 	if err != nil {
 		return zeroID, nil, fmt.Errorf("batch: open: %w", err)
@@ -278,12 +344,14 @@ func DecodeBatch(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, error) {
 	case batchFlagFlate:
 		// Legacy path: decode batches from older peers that still emit DEFLATE.
 		r := flate.NewReader(bytes.NewReader(rawPlain[1:]))
-		var buf bytes.Buffer
-		if _, err := io.Copy(&buf, r); err != nil {
+		decompressed, err := readAllLimited(r, maxDecodedBatchPlainSize)
+		if closeErr := r.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+		if err != nil {
 			return zeroID, nil, fmt.Errorf("batch: flate decompress: %w", err)
 		}
-		r.Close()
-		plain = buf.Bytes()
+		plain = decompressed
 	case batchFlagZstd:
 		dec := zstdDecPool.Get().(*zstd.Decoder)
 		decompressed, err := dec.DecodeAll(rawPlain[1:], nil)
@@ -295,6 +363,9 @@ func DecodeBatch(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, error) {
 	default:
 		return zeroID, nil, fmt.Errorf("batch: unknown flags byte 0x%02x", rawPlain[0])
 	}
+	if len(plain) > maxDecodedBatchPlainSize {
+		return zeroID, nil, fmt.Errorf("batch: expanded plaintext too large (%d bytes > %d)", len(plain), maxDecodedBatchPlainSize)
+	}
 
 	if len(plain) < ClientIDLen+2 {
 		return zeroID, nil, errors.New("batch: short header")
@@ -304,6 +375,9 @@ func DecodeBatch(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, error) {
 	off := ClientIDLen
 	count := int(binary.BigEndian.Uint16(plain[off : off+2]))
 	off += 2
+	if count == 0 {
+		return clientID, nil, nil
+	}
 	frames := make([]*Frame, 0, count)
 	for i := 0; i < count; i++ {
 		if len(plain) < off+4 {
@@ -322,4 +396,16 @@ func DecodeBatch(c *Crypto, body []byte) ([ClientIDLen]byte, []*Frame, error) {
 		off += flen
 	}
 	return clientID, frames, nil
+}
+
+func readAllLimited(r io.Reader, limit int) ([]byte, error) {
+	lr := &io.LimitedReader{R: r, N: int64(limit) + 1}
+	out, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > limit {
+		return nil, fmt.Errorf("expanded payload too large (%d bytes > %d)", len(out), limit)
+	}
+	return out, nil
 }

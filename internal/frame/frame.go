@@ -34,6 +34,10 @@ type Frame struct {
 
 func (f *Frame) HasFlag(flag uint8) bool { return f.Flags&flag != 0 }
 
+func (f *Frame) EncodedLen() int {
+	return SessionIDLen + 8 + 1 + 1 + len(f.Target) + 4 + len(f.Payload)
+}
+
 // Marshal serializes the frame to a byte slice using the schema:
 //
 //	session_id  : 16 bytes
@@ -44,29 +48,40 @@ func (f *Frame) HasFlag(flag uint8) bool { return f.Flags&flag != 0 }
 //	payload_len : uint32 BE
 //	payload     : N bytes
 func (f *Frame) Marshal() ([]byte, error) {
+	return f.AppendMarshal(make([]byte, 0, f.EncodedLen()))
+}
+
+func (f *Frame) AppendMarshal(dst []byte) ([]byte, error) {
 	if len(f.Target) > maxTargetLen {
 		return nil, fmt.Errorf("target too long: %d > %d", len(f.Target), maxTargetLen)
 	}
 	if len(f.Payload) > maxPayloadSize {
 		return nil, fmt.Errorf("payload too large: %d", len(f.Payload))
 	}
-	size := SessionIDLen + 8 + 1 + 1 + len(f.Target) + 4 + len(f.Payload)
-	out := make([]byte, size)
+	size := f.EncodedLen()
+	base := len(dst)
+	if cap(dst)-base < size {
+		next := make([]byte, base, base+size)
+		copy(next, dst)
+		dst = next
+	}
+	dst = dst[:base+size]
+	out := dst[base:]
 	off := 0
-	copy(out[off:], f.SessionID[:])
+	copy(out[off:off+SessionIDLen], f.SessionID[:])
 	off += SessionIDLen
-	binary.BigEndian.PutUint64(out[off:], f.Seq)
+	binary.BigEndian.PutUint64(out[off:off+8], f.Seq)
 	off += 8
 	out[off] = f.Flags
 	off++
 	out[off] = uint8(len(f.Target))
 	off++
-	copy(out[off:], f.Target)
+	copy(out[off:off+len(f.Target)], f.Target)
 	off += len(f.Target)
-	binary.BigEndian.PutUint32(out[off:], uint32(len(f.Payload)))
+	binary.BigEndian.PutUint32(out[off:off+4], uint32(len(f.Payload)))
 	off += 4
-	copy(out[off:], f.Payload)
-	return out, nil
+	copy(out[off:off+len(f.Payload)], f.Payload)
+	return dst, nil
 }
 
 // Unmarshal parses a frame produced by Marshal. Returns the number of bytes

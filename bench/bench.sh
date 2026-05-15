@@ -8,6 +8,8 @@
 #   ./bench/bench.sh --baseline v1.2.0     # diff against bench/baselines/v1.2.0.json
 #   ./bench/bench.sh --update v1.3.0       # rebuild + re-record bench/baselines/v1.3.0.json
 #   ./bench/bench.sh --scenario ttfb_p50_p95
+#   ./bench/bench.sh --transport direct_stream
+#   ./bench/bench.sh --smoke               # quick current-tree run, no baseline needed
 #   ./bench/bench.sh --verbose             # stream child stdout/stderr
 #
 # Set BENCH_FAIL_THRESHOLD_PCT (default 10) to change the regression threshold.
@@ -24,12 +26,14 @@ WORKTREE_DIR="$BENCH_DIR/.worktrees"
 
 mkdir -p "$BIN_DIR" "$BASELINES_DIR" "$RESULTS_DIR" "$WORKTREE_DIR"
 
-DEFAULT_BASELINE="$(git -C "$ROOT" tag --list 'v*' --sort=-version:refname | head -n 1)"
+DEFAULT_BASELINE="$({ git -C "$ROOT" tag --list 'v*' --sort=-version:refname 2>/dev/null || true; } | head -n 1)"
 
 BASELINE=""
 UPDATE_REF=""
 SCENARIOS=""
+TRANSPORT="direct_post"
 VERBOSE=""
+SMOKE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,8 +49,16 @@ while [[ $# -gt 0 ]]; do
             SCENARIOS="${2:?missing scenarios for --scenario}"
             shift 2
             ;;
+        --transport)
+            TRANSPORT="${2:?missing transport for --transport}"
+            shift 2
+            ;;
         --verbose|-v)
             VERBOSE="-v"
+            shift
+            ;;
+        --smoke)
+            SMOKE="1"
             shift
             ;;
         -h|--help)
@@ -60,7 +72,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$BASELINE" && -z "$UPDATE_REF" ]]; then
+if [[ -z "$BASELINE" && -z "$UPDATE_REF" && -z "$SMOKE" ]]; then
     BASELINE="$DEFAULT_BASELINE"
 fi
 
@@ -118,9 +130,28 @@ run_harness() {
         --out "$out" \
         --ref "$ref" \
         --commit "$commit" \
+        --transport "$TRANSPORT" \
         ${SCENARIOS:+--scenarios "$SCENARIOS"} \
         $VERBOSE
 }
+
+if [[ -n "$SMOKE" ]]; then
+    HEAD_BIN="$BENCH_DIR/.smoke_bin"
+    rm -rf "$HEAD_BIN"
+    mkdir -p "$HEAD_BIN"
+    echo "==> building current tree for smoke run"
+    ( cd "$ROOT" && \
+        go build -trimpath -o "$HEAD_BIN/goose-client" ./cmd/client && \
+        go build -trimpath -o "$HEAD_BIN/goose-server" ./cmd/server )
+    OUT="$RESULTS_DIR/smoke.json"
+    if [[ -z "$SCENARIOS" ]]; then
+        SCENARIOS="ttfb_p50_p95"
+    fi
+    run_harness "smoke" "$OUT" "$HEAD_BIN"
+    echo
+    echo "==> smoke results: $OUT"
+    exit 0
+fi
 
 # ─── --update path: build the named ref, run, write to baselines/ ──────────
 if [[ -n "$UPDATE_REF" ]]; then

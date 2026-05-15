@@ -24,6 +24,7 @@ into your pre-tag flow when you're ready.
 ```sh
 ./bench/bench.sh --baseline v1.2.0
 ./bench/bench.sh --scenario ttfb_p50_p95
+./bench/bench.sh --scenario ttfb_p50_p95 --transport direct_stream
 ./bench/bench.sh --scenario throughput_up_64MB_1session,sessions_per_sec
 ./bench/bench.sh --verbose                    # stream child stdout/stderr
 ./bench/bench.sh --update v1.3.0              # re-record a baseline
@@ -40,8 +41,15 @@ into your pre-tag flow when you're ready.
 | `ttfb_p50_p95` | 50 sequential 1-byte echoes, latency percentiles | `p50_us`, `p95_us`, `p99_us` |
 | `sessions_per_sec` | Open/close churn against quick sink for 10 s | `per_sec` |
 | `idle_overhead_15s` | 50 idle echo connections; sample CPU% every 500 ms | `client_cpu_mean`, `server_cpu_mean` |
+| `mixed_stream_bad_syn_bulk` | One bad SYN target while short echoes and a 1 MB download run | `duration_ms`, nested TTFB/download metrics |
 
 Throughput numbers are bounded by `ActiveDrainWindow` (350 ms) — every HTTP round-trip costs at least one window, so a single-session upload caps at roughly `MaxFramePayload × maxDrainFramesPerSession / ActiveDrainWindow` ≈ 6 MB/s. Sizes above are tuned so the full suite finishes in ~90 s.
+
+## Transport Comparison
+
+Run latency scenarios once with `--transport direct_post` and once with
+`--transport direct_stream` to compare direct POST TTFB against the persistent
+WebSocket stream path on the same machine.
 
 ## Layout
 

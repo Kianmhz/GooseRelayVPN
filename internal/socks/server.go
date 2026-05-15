@@ -56,12 +56,27 @@ func Serve(_ context.Context, listenAddr, user, pass string, debugTiming bool, f
 		}))
 	}
 
-	ln, err := net.Listen("tcp", listenAddr)
+	ln, err := net.Listen(listenNetwork(listenAddr), listenAddr)
 	if err != nil {
 		return err
 	}
 	server := socks5.NewServer(opts...)
 	return server.Serve(&noDelayListener{Listener: ln})
+}
+
+func listenNetwork(listenAddr string) string {
+	host, _, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return "tcp"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "tcp"
+	}
+	if ip.To4() != nil {
+		return "tcp4"
+	}
+	return "tcp6"
 }
 
 // noDelayListener wraps net.Listener so each accepted *net.TCPConn has both

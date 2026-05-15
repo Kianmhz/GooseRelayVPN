@@ -2,8 +2,8 @@
 //
 // It owns three child processes: the bench sink (upstream targets), goose-server
 // (the VPS exit), and goose-client (the local SOCKS5 listener). The client is
-// pointed at goose-server directly via the relay_urls config affordance, which
-// bypasses Apps Script entirely so results are reproducible.
+// pointed at goose-server directly (direct POST or direct WebSocket stream),
+// bypassing Apps Script entirely so results are reproducible.
 //
 // Each scenario is a Go function that drives traffic through the local SOCKS5
 // proxy. Results are written as a single JSON document so bench.sh can diff
@@ -91,13 +91,17 @@ func main() {
 		ref         = flag.String("ref", "", "ref label to record in JSON (e.g. v1.3.0, HEAD)")
 		commit      = flag.String("commit", "", "short commit SHA to record in JSON")
 		only        = flag.String("scenarios", "", "comma-separated subset of scenario names to run; empty = all")
+		transport   = flag.String("transport", "direct_post", "loopback transport: direct_post or direct_stream")
 		showVerbose = flag.Bool("v", false, "stream child stdout/stderr to this process")
 	)
 	flag.Parse()
 
 	if *clientBin == "" || *serverBin == "" || *sinkBin == "" || *outPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: harness --client-bin PATH --server-bin PATH --sink-bin PATH --out PATH [--ref X] [--commit Y] [--scenarios a,b]")
+		fmt.Fprintln(os.Stderr, "usage: harness --client-bin PATH --server-bin PATH --sink-bin PATH --out PATH [--ref X] [--commit Y] [--scenarios a,b] [--transport direct_post|direct_stream]")
 		os.Exit(2)
+	}
+	if *transport != "direct_post" && *transport != "direct_stream" {
+		log.Fatalf("invalid --transport %q", *transport)
 	}
 
 	scenarios := allScenarios()
@@ -125,7 +129,7 @@ func main() {
 	defer os.RemoveAll(tmpDir)
 
 	tunnelKey := mustHexKey()
-	if err := writeConfigs(tmpDir, tunnelKey); err != nil {
+	if err := writeConfigs(tmpDir, tunnelKey, *transport); err != nil {
 		log.Fatalf("write configs: %v", err)
 	}
 
@@ -228,7 +232,8 @@ func allScenarios() []scenario {
 		{"throughput_down_8MB_1session", scenarioThroughputDown(8 * 1024 * 1024)},
 		{"ttfb_p50_p95", scenarioTTFB(50)},
 		{"sessions_per_sec", scenarioSessionsPerSec(10 * time.Second)},
-		{"idle_overhead_15s", scenarioIdleOverhead(15 * time.Second, 50)},
+		{"idle_overhead_15s", scenarioIdleOverhead(15*time.Second, 50)},
+		{"mixed_stream_bad_syn_bulk", scenarioMixedStreamBadSYNBulk()},
 	}
 }
 
@@ -458,18 +463,73 @@ func scenarioIdleOverhead(d time.Duration, sessions int) func(context.Context, *
 			}
 		}
 		return map[string]any{
-			"sessions":         sessions,
-			"duration_ms":      d.Milliseconds(),
-			"samples":          len(clientCPU),
-			"client_cpu_mean":  round2(meanFloat(clientCPU)),
-			"client_cpu_max":   round2(maxFloat(clientCPU)),
-			"server_cpu_mean":  round2(meanFloat(serverCPU)),
-			"server_cpu_max":   round2(maxFloat(serverCPU)),
+			"sessions":        sessions,
+			"duration_ms":     d.Milliseconds(),
+			"samples":         len(clientCPU),
+			"client_cpu_mean": round2(meanFloat(clientCPU)),
+			"client_cpu_max":  round2(maxFloat(clientCPU)),
+			"server_cpu_mean": round2(meanFloat(serverCPU)),
+			"server_cpu_max":  round2(maxFloat(serverCPU)),
 		}, nil
 	}
 }
 
 // ─── child-process management ───────────────────────────────────────────────
+
+func scenarioMixedStreamBadSYNBulk() func(context.Context, *runEnv) (any, error) {
+	return func(ctx context.Context, env *runEnv) (any, error) {
+		t0 := time.Now()
+		badStarted := make(chan struct{})
+		go func() {
+			close(badStarted)
+			conn, err := env.dialer.Dial("tcp", "10.255.255.1:81")
+			if err == nil {
+				_ = conn.Close()
+			}
+		}()
+		select {
+		case <-badStarted:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		// Let the bad CONNECT enqueue first. If direct-stream SYN routing ever
+		// becomes serial again, the echo/download work below stalls behind this
+		// target until the upstream dial timeout fires.
+		time.Sleep(100 * time.Millisecond)
+
+		bulkCh := make(chan struct {
+			val any
+			err error
+		}, 1)
+		go func() {
+			val, err := scenarioThroughputDown(1*1024*1024)(ctx, env)
+			bulkCh <- struct {
+				val any
+				err error
+			}{val: val, err: err}
+		}()
+
+		ttfb, err := scenarioTTFB(20)(ctx, env)
+		if err != nil {
+			return nil, fmt.Errorf("ttfb under bad SYN/bulk mix: %w", err)
+		}
+		var bulk any
+		select {
+		case got := <-bulkCh:
+			if got.err != nil {
+				return nil, fmt.Errorf("download under bad SYN mix: %w", got.err)
+			}
+			bulk = got.val
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return map[string]any{
+			"duration_ms": time.Since(t0).Milliseconds(),
+			"ttfb":        ttfb,
+			"download":    bulk,
+		}, nil
+	}
+}
 
 func startProcess(ctx context.Context, bin string, args []string, verbose bool, label string) (*exec.Cmd, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -589,7 +649,7 @@ func mustHexKey() string {
 	return hex.EncodeToString(b[:])
 }
 
-func writeConfigs(dir, tunnelKey string) error {
+func writeConfigs(dir, tunnelKey, transport string) error {
 	serverCfg := map[string]any{
 		"server_host": "127.0.0.1",
 		"server_port": serverPort,
@@ -598,9 +658,16 @@ func writeConfigs(dir, tunnelKey string) error {
 	clientCfg := map[string]any{
 		"socks_host":   "127.0.0.1",
 		"socks_port":   socksPort,
-		"relay_urls":   []string{fmt.Sprintf("http://127.0.0.1:%d/tunnel", serverPort)},
 		"tunnel_key":   tunnelKey,
 		"debug_timing": false,
+		"auto_tune":    false,
+	}
+	if transport == "direct_stream" {
+		clientCfg["transport_mode"] = "direct_stream"
+		clientCfg["direct_stream_urls"] = []string{fmt.Sprintf("ws://127.0.0.1:%d/stream", serverPort)}
+	} else {
+		clientCfg["transport_mode"] = "direct_post"
+		clientCfg["relay_urls"] = []string{fmt.Sprintf("http://127.0.0.1:%d/tunnel", serverPort)}
 	}
 	if err := writeJSON(filepath.Join(dir, "server_config.json"), serverCfg); err != nil {
 		return err
