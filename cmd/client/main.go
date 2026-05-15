@@ -9,12 +9,14 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/kianmhz/GooseRelayVPN/internal/carrier"
 	"github.com/kianmhz/GooseRelayVPN/internal/config"
+	"github.com/kianmhz/GooseRelayVPN/internal/protocol"
 	"github.com/kianmhz/GooseRelayVPN/internal/session"
 	"github.com/kianmhz/GooseRelayVPN/internal/socks"
 )
@@ -112,6 +114,155 @@ func summarizeScriptURLs(scriptURLs []string) string {
 	return strings.Join(parts, ", ")
 }
 
+func resolveDefaultConfigPath(path, defaultName string) string {
+	if path != defaultName {
+		return path
+	}
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return path
+	}
+	next := filepath.Join(filepath.Dir(exe), defaultName)
+	if _, err := os.Stat(next); err == nil {
+		return next
+	}
+	return path
+}
+
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func hotReloadPostWorkerPlan(c *config.Client) int {
+	mode := strings.TrimSpace(strings.ToLower(c.TransportMode))
+	if mode == "direct_stream" || len(c.ScriptURLs) == 0 {
+		return 0
+	}
+	workers := c.WorkersPerEndpoint
+	if workers <= 0 {
+		workers = protocol.DefaultWorkersPerEndpoint
+	}
+	idleSlots := c.IdleSlotsPerBucket
+	if idleSlots <= 0 {
+		idleSlots = 1
+	}
+	buckets := make(map[string]struct{}, len(c.ScriptURLs))
+	for i := range c.ScriptURLs {
+		account := ""
+		if i < len(c.ScriptAccounts) {
+			account = strings.TrimSpace(c.ScriptAccounts[i])
+		}
+		buckets[account] = struct{}{}
+	}
+	if len(buckets) == 0 {
+		return 0
+	}
+	return (workers + idleSlots - 1) * len(buckets)
+}
+
+func hotReloadRestartReason(current, next *config.Client) string {
+	switch {
+	case current.AESKeyHex != next.AESKeyHex:
+		return "tunnel_key changed"
+	case current.ListenAddr != next.ListenAddr:
+		return "SOCKS listen address changed"
+	case current.TransportMode != next.TransportMode:
+		return "transport_mode changed"
+	case current.UseFronting != next.UseFronting:
+		return "relay mode changed"
+	case current.PerformanceMode != next.PerformanceMode:
+		return "performance_mode changed"
+	case current.AutoTune != next.AutoTune:
+		return "auto_tune changed"
+	case current.DebugTiming != next.DebugTiming:
+		return "debug_timing changed"
+	case current.SocksUser != next.SocksUser || current.SocksPass != next.SocksPass:
+		return "SOCKS auth changed"
+	case current.GoogleIP != next.GoogleIP:
+		return "google_host changed"
+	case !sameStringSlice(current.SNIHosts, next.SNIHosts):
+		return "sni changed"
+	case !sameStringSlice(current.DirectStreamURLs, next.DirectStreamURLs):
+		return "direct_stream_urls changed"
+	case current.CoalesceStepMs != next.CoalesceStepMs || current.CoalesceMaxMs != next.CoalesceMaxMs:
+		return "coalesce settings changed"
+	case current.PollIdleSleepMs != next.PollIdleSleepMs:
+		return "poll_idle_sleep_ms changed"
+	case current.EndpointBlacklistBaseMs != next.EndpointBlacklistBaseMs || current.EndpointBlacklistMaxMs != next.EndpointBlacklistMaxMs:
+		return "endpoint blacklist TTL changed"
+	case current.MaxRequestBytesPreEncode != next.MaxRequestBytesPreEncode:
+		return "max_request_bytes_pre_encode changed"
+	case current.StreamConnectTimeoutMs != next.StreamConnectTimeoutMs ||
+		current.StreamPingIntervalMs != next.StreamPingIntervalMs ||
+		current.StreamReconnectBackoffMs != next.StreamReconnectBackoffMs:
+		return "direct stream timeout changed"
+	case hotReloadPostWorkerPlan(current) != hotReloadPostWorkerPlan(next):
+		return "relay worker count changed"
+	default:
+		return ""
+	}
+}
+
+func watchClientConfig(ctx context.Context, path string, initial *config.Client, carr *carrier.Client) {
+	info, err := os.Stat(path)
+	if err != nil {
+		log.Printf("[config] hot reload disabled: stat %s: %v", path, err)
+		return
+	}
+	lastMod := info.ModTime()
+	current := *initial
+	current.SNIHosts = append([]string(nil), initial.SNIHosts...)
+	current.ScriptURLs = append([]string(nil), initial.ScriptURLs...)
+	current.ScriptAccounts = append([]string(nil), initial.ScriptAccounts...)
+	current.DirectStreamURLs = append([]string(nil), initial.DirectStreamURLs...)
+
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			log.Printf("[config] reload skipped: stat %s: %v", path, err)
+			continue
+		}
+		if !info.ModTime().After(lastMod) {
+			continue
+		}
+		lastMod = info.ModTime()
+		next, err := config.LoadClient(path)
+		if err != nil {
+			log.Printf("[config] reload skipped: %v", err)
+			continue
+		}
+		if reason := hotReloadRestartReason(&current, next); reason != "" {
+			log.Printf("[config] reload saw %s; restart the client for that change to take effect", reason)
+			continue
+		}
+		count := carr.UpdateEndpoints(next.ScriptURLs, next.ScriptAccounts)
+		log.Printf("[config] reloaded %d relay endpoint(s): %s", count, summarizeScriptURLs(next.ScriptURLs))
+		current = *next
+		current.SNIHosts = append([]string(nil), next.SNIHosts...)
+		current.ScriptURLs = append([]string(nil), next.ScriptURLs...)
+		current.ScriptAccounts = append([]string(nil), next.ScriptAccounts...)
+		current.DirectStreamURLs = append([]string(nil), next.DirectStreamURLs...)
+	}
+}
+
 const gooseBanner = `
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⣤⣄⡀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⣏⣹⣿⠄⠀⠀⠀⠀⠀
@@ -135,15 +286,30 @@ func main() {
 	setupClientLogging()
 
 	configPath := flag.String("config", "client_config.json", "path to client config JSON")
+	dumpDiag := flag.Bool("dump-diag", false, "write a redacted diagnostics zip and exit")
+	diagOutput := flag.String("diag-output", "", "path for --dump-diag output (default: goose-diagnostics-YYYYMMDD-HHMMSS.zip)")
 	flag.Parse()
+	resolvedConfigPath := resolveDefaultConfigPath(*configPath, "client_config.json")
+	if *dumpDiag {
+		out, err := writeDiagnosticsZip(*diagOutput, resolvedConfigPath, version)
+		if err != nil {
+			log.Fatalf("[client] diagnostics failed: %v", err)
+		}
+		log.Printf("[client] diagnostics written to %s", out)
+		return
+	}
 
-	cfg, err := config.LoadClient(*configPath)
+	cfg, err := config.LoadClient(resolvedConfigPath)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
 	log.Printf("[client] GooseRelayVPN client starting")
-	log.Printf("[client] config loaded from %s", *configPath)
+	log.Printf("[client] config loaded from %s", resolvedConfigPath)
 	log.Printf("[client] SOCKS5 proxy: socks5://%s", cfg.ListenAddr)
+	log.Printf("[client] transport mode: %s", cfg.TransportMode)
+	if len(cfg.DirectStreamURLs) > 0 {
+		log.Printf("[client] direct stream endpoints: %d", len(cfg.DirectStreamURLs))
+	}
 	if cfg.UseFronting {
 		log.Printf("[client] mode: fronting")
 		if len(cfg.SNIHosts) == 1 {
@@ -158,18 +324,35 @@ func main() {
 	if cfg.DebugTiming {
 		log.Printf("[client] debug_timing enabled — per-session TTFB and per-poll RTT will be logged")
 	}
+	if cfg.AutoTune {
+		log.Printf("[client] auto_tune enabled - poll idle sleep will adjust inside fixed latency-safe caps")
+	}
 	if cfg.CoalesceStepMs > 0 {
 		log.Printf("[client] uplink coalescing: step=%dms (internal safety cap %dms; bursts of TX collapse into a single poll)", cfg.CoalesceStepMs, cfg.CoalesceMaxMs)
 	}
 	carr, err := carrier.New(carrier.Config{
-		ScriptURLs:         cfg.ScriptURLs,
-		ScriptAccounts:     cfg.ScriptAccounts,
-		AESKeyHex:          cfg.AESKeyHex,
-		DebugTiming:        cfg.DebugTiming,
-		ClientVersion:      version,
-		CoalesceStep:       time.Duration(cfg.CoalesceStepMs) * time.Millisecond,
-		CoalesceMax:        time.Duration(cfg.CoalesceMaxMs) * time.Millisecond,
-		IdleSlotsPerBucket: cfg.IdleSlotsPerBucket,
+		ScriptURLs:               cfg.ScriptURLs,
+		ScriptAccounts:           cfg.ScriptAccounts,
+		DirectStreamURLs:         cfg.DirectStreamURLs,
+		TransportMode:            cfg.TransportMode,
+		AESKeyHex:                cfg.AESKeyHex,
+		DebugTiming:              cfg.DebugTiming,
+		AutoTune:                 cfg.AutoTune,
+		UseFronting:              cfg.UseFronting,
+		BinaryDirect:             !cfg.UseFronting,
+		ClientVersion:            version,
+		CoalesceStep:             time.Duration(cfg.CoalesceStepMs) * time.Millisecond,
+		CoalesceMax:              time.Duration(cfg.CoalesceMaxMs) * time.Millisecond,
+		IdleSlotsPerBucket:       cfg.IdleSlotsPerBucket,
+		WorkersPerEndpoint:       cfg.WorkersPerEndpoint,
+		PollIdleSleep:            time.Duration(cfg.PollIdleSleepMs) * time.Millisecond,
+		EndpointBlacklistBaseTTL: time.Duration(cfg.EndpointBlacklistBaseMs) * time.Millisecond,
+		EndpointBlacklistMaxTTL:  time.Duration(cfg.EndpointBlacklistMaxMs) * time.Millisecond,
+		EndpointOutageGrace:      time.Duration(cfg.EndpointOutageGraceMs) * time.Millisecond,
+		MaxRequestBytesPreEncode: cfg.MaxRequestBytesPreEncode,
+		StreamConnectTimeout:     time.Duration(cfg.StreamConnectTimeoutMs) * time.Millisecond,
+		StreamPingInterval:       time.Duration(cfg.StreamPingIntervalMs) * time.Millisecond,
+		StreamReconnectBackoff:   time.Duration(cfg.StreamReconnectBackoffMs) * time.Millisecond,
 		Fronting: carrier.FrontingConfig{
 			GoogleIP: cfg.GoogleIP,
 			SNIHosts: cfg.SNIHosts,
@@ -181,21 +364,30 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go watchClientConfig(ctx, resolvedConfigPath, cfg, carr)
 
-	// Pre-flight check: one-shot end-to-end probe so users see actionable
-	// errors at startup instead of cryptic mid-session failures.
-	log.Printf("[client] running pre-flight check (Apps Script reachable, VPS reachable, key matches)…")
-	diagCtx, cancelDiag := context.WithTimeout(ctx, 20*time.Second)
-	if err := carr.Diagnose(diagCtx); err != nil {
-		log.Printf("[client] pre-flight FAILED:")
-		for _, line := range strings.Split(err.Error(), "\n") {
-			log.Printf("[client]   %s", line)
+	if len(cfg.ScriptURLs) > 0 {
+		// Pre-flight check: one-shot end-to-end probe so users see actionable
+		// errors at startup instead of cryptic mid-session failures.
+		if cfg.UseFronting {
+			log.Printf("[client] running pre-flight check (Apps Script reachable, VPS reachable, key matches)…")
+		} else {
+			log.Printf("[client] running pre-flight check (direct relay reachable, key matches)…")
 		}
-		log.Printf("[client] continuing anyway — the issue may be transient or recover on its own")
+		diagCtx, cancelDiag := context.WithTimeout(ctx, 20*time.Second)
+		if err := carr.Diagnose(diagCtx); err != nil {
+			log.Printf("[client] pre-flight FAILED:")
+			for _, line := range strings.Split(err.Error(), "\n") {
+				log.Printf("[client]   %s", line)
+			}
+			log.Printf("[client] continuing anyway — the issue may be transient or recover on its own")
+		} else {
+			log.Printf("[client] pre-flight OK: relay healthy, AES key matches end-to-end")
+		}
+		cancelDiag()
 	} else {
-		log.Printf("[client] pre-flight OK: relay healthy, AES key matches end-to-end")
+		log.Printf("[client] pre-flight skipped: direct_stream-only mode will connect to the VPS stream endpoint")
 	}
-	cancelDiag()
 
 	go func() {
 		if err := carr.Run(ctx); err != nil && ctx.Err() == nil {
@@ -224,7 +416,13 @@ func main() {
 	// Send RSTs for active sessions so the server can release their upstream
 	// connections immediately. Bounded so a slow server can't block exit.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	shutdownStart := time.Now()
 	carr.Shutdown(shutdownCtx)
+	if err := shutdownCtx.Err(); err != nil {
+		log.Printf("[client] shutdown timed out after %s; exiting with local cleanup only", time.Since(shutdownStart).Round(time.Millisecond))
+	} else {
+		log.Printf("[client] shutdown completed in %s", time.Since(shutdownStart).Round(time.Millisecond))
+	}
 	shutdownCancel()
 	cancel()
 }

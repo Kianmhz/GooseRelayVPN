@@ -47,6 +47,22 @@ func (c *Client) logStats() {
 		c.stats.rstFromServer.Load(),
 		healthy, total,
 	)
+	log.Printf("[stats] latency ttfb[%s] endpoint_rtt[%s] queue_wait[%s] encode[%s] decode[%s]",
+		c.stats.ttfb.Snapshot().StringMS(),
+		c.stats.endpointRTT.Snapshot().StringMS(),
+		c.stats.queueWait.Snapshot().StringMS(),
+		c.stats.encode.Snapshot().StringMS(),
+		c.stats.decode.Snapshot().StringMS(),
+	)
+	log.Printf("[stats] payload req={%s} resp={%s} wire_ratio={%s} stream(ok=%d fail=%d drop=%d post_fallback=%d)",
+		c.stats.reqSize.String(),
+		c.stats.respSize.String(),
+		c.stats.wireRatio.String(),
+		c.stats.streamOK.Load(),
+		c.stats.streamFail.Load(),
+		c.stats.streamDrops.Load(),
+		c.stats.postFallbacks.Load(),
+	)
 	log.Printf("[stats] endpoints: %s", endpointDetail)
 	if accountSummary != "" {
 		log.Printf("[stats] %s", strings.TrimSpace(accountSummary))

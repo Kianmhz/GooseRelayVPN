@@ -5,27 +5,61 @@
 // and never sees plaintext or holds the key.
 //
 // Wire: client POSTs base64(encrypted batch). We forward the bytes verbatim
-// to RELAY_URL and return its response body verbatim.
+// to one of RELAY_URLS and return its response body verbatim.
 //
-// Replace RELAY_URL with your VPS address before deploying.
+// Replace RELAY_URLS with your VPS address(es) before deploying.
 
-const RELAY_URL = 'http://YOUR.VPS.IP:8443/tunnel';
+const RELAY_URLS = [
+  // Replace YOUR_SERVER_PORT with server_config.json's server_port.
+  // The dist/server_config.json used for the current test listens on 5443.
+  'http://YOUR.VPS.IP:YOUR_SERVER_PORT/tunnel',
+];
 const FORWARDER_VERSION = 1;
 const PROTOCOL_VERSION = 1;
+const ENABLE_INVOCATION_COUNTING = false;
+const GAS_RELAY_LOOP_RE = /^https?:\/\/script\.google\.com\/macros\//i;
 
 function doPost(e) {
-  bumpInvocationCount_();
+  for (let i = 0; i < RELAY_URLS.length; i++) {
+    if (GAS_RELAY_LOOP_RE.test(RELAY_URLS[i])) {
+      return ContentService
+        .createTextOutput('relay_loop_detected: RELAY_URLS must point to your VPS /tunnel endpoint, not Apps Script')
+        .setMimeType(ContentService.MimeType.TEXT);
+    }
+  }
+  if (ENABLE_INVOCATION_COUNTING) {
+    bumpInvocationCount_();
+  }
   const payload = (e && e.postData && e.postData.contents) || '';
-  const resp = UrlFetchApp.fetch(RELAY_URL, {
-    method: 'post',
-    contentType: 'text/plain',
-    payload: payload,
-    muteHttpExceptions: true,
-    followRedirects: false,
-    deadline: 30,  // seconds; long-poll window is kept at 8s for Apps Script stability
-  });
+  let lastText = '';
+  for (let i = 0; i < RELAY_URLS.length; i++) {
+    try {
+      const resp = UrlFetchApp.fetch(RELAY_URLS[i], {
+        method: 'post',
+        contentType: 'text/plain',
+        payload: payload,
+        muteHttpExceptions: true,
+        followRedirects: false,
+      });
+      const status = resp.getResponseCode();
+      const text = resp.getContentText();
+      lastText = text;
+      if (status === 200) {
+        return ContentService
+          .createTextOutput(text)
+          .setMimeType(ContentService.MimeType.TEXT);
+      }
+      lastText = JSON.stringify({
+        e: 'upstream_status',
+        status: status,
+        body: text.slice(0, 1024),
+      });
+    } catch (err) {
+      lastText = String(err);
+    }
+  }
   return ContentService
-    .createTextOutput(resp.getContentText())
+    .createTextOutput(lastText)
     .setMimeType(ContentService.MimeType.TEXT);
 }
 

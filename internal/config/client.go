@@ -13,19 +13,25 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/kianmhz/GooseRelayVPN/internal/protocol"
 )
 
 // Client is the relay-tunnel client config.
 type Client struct {
-	ListenAddr  string
-	GoogleIP    string   // "ip:port"; empty when direct relay_urls mode is used
-	SNIHosts    []string // one or more TLS SNI names; empty when direct relay_urls mode is used
-	ScriptURLs  []string // one or more relay endpoints (Apps Script URLs or direct relay_urls)
-	UseFronting bool
-	AESKeyHex   string // 64-char hex
-	DebugTiming bool   // when true, log per-session TTFB and per-poll Apps Script RTT
-	SocksUser   string // optional SOCKS5 username (RFC 1929); empty = no auth
-	SocksPass   string // optional SOCKS5 password (RFC 1929); empty = no auth
+	ListenAddr       string
+	GoogleIP         string   // "ip:port"; empty when direct relay_urls mode is used
+	SNIHosts         []string // one or more TLS SNI names; empty when direct relay_urls mode is used
+	ScriptURLs       []string // one or more relay endpoints (Apps Script URLs or direct relay_urls)
+	DirectStreamURLs []string
+	UseFronting      bool
+	AESKeyHex        string // 64-char hex
+	DebugTiming      bool   // when true, log per-session TTFB and per-poll Apps Script RTT
+	AutoTune         bool
+	SocksUser        string // optional SOCKS5 username (RFC 1929); empty = no auth
+	SocksPass        string // optional SOCKS5 password (RFC 1929); empty = no auth
+	PerformanceMode  string
+	TransportMode    string
 
 	// ScriptAccounts is an optional parallel slice to ScriptURLs. When the user
 	// labels deployments with an `account` field in script_keys, the carrier
@@ -47,7 +53,16 @@ type Client struct {
 	// model's safe baseline). Raising to 2–3 increases download throughput
 	// when an account has multiple deployments, at the cost of more
 	// simultaneous executions on that account. 0 = use default.
-	IdleSlotsPerBucket int
+	IdleSlotsPerBucket       int
+	WorkersPerEndpoint       int
+	PollIdleSleepMs          int
+	EndpointBlacklistBaseMs  int
+	EndpointBlacklistMaxMs   int
+	EndpointOutageGraceMs    int
+	MaxRequestBytesPreEncode int
+	StreamConnectTimeoutMs   int
+	StreamPingIntervalMs     int
+	StreamReconnectBackoffMs int
 }
 
 // clientFile is the user-friendly client config format.
@@ -78,6 +93,11 @@ type clientFile struct {
 	// When set, these URLs are used as-is and Google fronting is disabled.
 	RelayURLs []string `json:"relay_urls"`
 
+	// Optional first-class direct streaming endpoints. Values may be ws://,
+	// wss://, http://, or https://. HTTP(S) values are normalized to WS(S);
+	// bare server or /tunnel paths are normalized to /stream.
+	DirectStreamURLs []string `json:"direct_stream_urls"`
+
 	// Shared AES key (64-char hex).
 	TunnelKey string `json:"tunnel_key"`
 
@@ -85,6 +105,7 @@ type clientFile struct {
 	// Apps Script round-trip latency to help pinpoint where a slow connection
 	// is spending its time. Off by default.
 	DebugTiming bool `json:"debug_timing"`
+	AutoTune    bool `json:"auto_tune"`
 
 	// Optional SOCKS5 RFC 1929 credentials. When set, clients must supply
 	// these credentials or the connection is rejected. Both must be non-empty
@@ -104,6 +125,46 @@ type clientFile struct {
 	// rejected — past that the per-account concurrency cap that issue #56
 	// surfaced becomes reachable again.
 	IdleSlotsPerBucket int `json:"idle_slots_per_bucket"`
+
+	PerformanceMode          string `json:"performance_mode"`
+	TransportMode            string `json:"transport_mode"`
+	WorkersPerEndpoint       int    `json:"workers_per_endpoint"`
+	PollIdleSleepMs          int    `json:"poll_idle_sleep_ms"`
+	EndpointBlacklistBaseMs  int    `json:"endpoint_blacklist_base_ms"`
+	EndpointBlacklistMaxMs   int    `json:"endpoint_blacklist_max_ms"`
+	EndpointOutageGraceMs    int    `json:"endpoint_outage_grace_ms"`
+	MaxRequestBytesPreEncode int    `json:"max_request_bytes_pre_encode"`
+	StreamConnectTimeoutMs   int    `json:"stream_connect_timeout_ms"`
+	StreamPingIntervalMs     int    `json:"stream_ping_interval_ms"`
+	StreamReconnectBackoffMs int    `json:"stream_reconnect_backoff_ms"`
+}
+
+var defaultSNIHosts = []string{"www.google.com", "mail.google.com", "accounts.google.com"}
+
+func normalizePerformanceMode(mode string) (string, error) {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	if mode == "" {
+		return "latency", nil
+	}
+	switch mode {
+	case "balanced", "latency", "throughput":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("performance_mode must be one of balanced, latency, throughput (got %q)", mode)
+	}
+}
+
+func normalizeTransportMode(mode string) (string, error) {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	if mode == "" {
+		return "auto", nil
+	}
+	switch mode {
+	case "auto", "apps_script", "direct_post", "direct_stream":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("transport_mode must be one of auto, apps_script, direct_post, direct_stream (got %q)", mode)
+	}
 }
 
 func firstNonEmpty(values ...string) string {
@@ -186,6 +247,33 @@ func normalizeRelayURL(v string) (string, error) {
 	return u.String(), nil
 }
 
+func normalizeDirectStreamURL(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", nil
+	}
+	u, err := url.Parse(v)
+	if err != nil {
+		return "", fmt.Errorf("invalid direct_stream_urls value %q: %w", v, err)
+	}
+	switch u.Scheme {
+	case "ws", "wss":
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	default:
+		return "", fmt.Errorf("invalid direct_stream_urls value %q: scheme must be ws, wss, http, or https", v)
+	}
+	if strings.TrimSpace(u.Host) == "" {
+		return "", fmt.Errorf("invalid direct_stream_urls value %q: host is required", v)
+	}
+	if u.Path == "" || u.Path == "/" || u.Path == "/tunnel" {
+		u.Path = "/stream"
+	}
+	return u.String(), nil
+}
+
 // scriptKeyEntry is the parsed result of one script_keys array element. The
 // JSON form is either a plain string (legacy / unlabeled) or an object with
 // id+account fields. Account is "" when unlabeled.
@@ -253,25 +341,26 @@ func validateDeploymentID(id string) error {
 
 // parseSNIHosts parses the "sni" JSON field, which may be either a single
 // string ("www.google.com") or an array (["www.google.com", "mail.google.com"]).
-// Falls back to ["www.google.com"] when the field is absent or empty.
+// Falls back to multiple Google SNI hosts when the field is absent or empty.
+// Each host gets its own fronted HTTP transport and connection pool, spreading
+// requests across several Google CDN throttle buckets by default.
 func parseSNIHosts(raw json.RawMessage) []string {
 	if len(raw) == 0 {
-		return []string{"www.google.com"}
+		return append([]string(nil), defaultSNIHosts...)
 	}
 	// Try string first (backward-compatible single-SNI config).
 	var single string
 	if err := json.Unmarshal(raw, &single); err == nil {
 		single = strings.TrimSpace(single)
 		if single == "" {
-			return []string{"www.google.com"}
+			return append([]string(nil), defaultSNIHosts...)
 		}
 		return []string{single}
 	}
 	// Try array.
 	var multi []string
 	if err := json.Unmarshal(raw, &multi); err != nil {
-		// Malformed — fall back to default and let the rest of validation catch it.
-		return []string{"www.google.com"}
+		return append([]string(nil), defaultSNIHosts...)
 	}
 	out := make([]string, 0, len(multi))
 	for _, h := range multi {
@@ -281,7 +370,7 @@ func parseSNIHosts(raw json.RawMessage) []string {
 		}
 	}
 	if len(out) == 0 {
-		return []string{"www.google.com"}
+		return append([]string(nil), defaultSNIHosts...)
 	}
 	return out
 }
@@ -322,16 +411,33 @@ func LoadClient(path string) (*Client, error) {
 	}
 	relayURLs = dedupeStrings(relayURLs)
 
+	directStreamURLs := make([]string, 0, len(f.DirectStreamURLs))
+	for _, raw := range f.DirectStreamURLs {
+		normalized, nerr := normalizeDirectStreamURL(raw)
+		if nerr != nil {
+			return nil, nerr
+		}
+		if normalized != "" {
+			directStreamURLs = append(directStreamURLs, normalized)
+		}
+	}
+	directStreamURLs = dedupeStrings(directStreamURLs)
+
 	key := strings.TrimSpace(f.TunnelKey)
-	if key == "" || key == "REPLACE_WITH_OUTPUT_OF_scripts_gen-key.sh" {
-		return nil, fmt.Errorf("tunnel_key is empty or still the placeholder text in %s.\n  Fix: generate a key with 'bash scripts/gen-key.sh' and paste the 64-character output into the tunnel_key field. The same value must be in server_config.json", path)
+	if key == "" || key == "REPLACE_WITH_OUTPUT_OF_scripts_gen-key.sh" || key == "REPLACE_WITH_64_HEX_CHARACTER_RANDOM_KEY" {
+		return nil, fmt.Errorf("tunnel_key is empty or still the placeholder text in %s.\n  Fix: generate 32 random bytes as 64 lowercase hex characters and paste that value into tunnel_key. The same value must be in server_config.json", path)
 	}
 	if len(key) != 64 {
-		return nil, fmt.Errorf("tunnel_key must be exactly 64 hex characters (got %d) in %s.\n  Fix: generate a fresh key with 'bash scripts/gen-key.sh' and paste the full output. Use the SAME value in client_config.json and server_config.json", len(key), path)
+		return nil, fmt.Errorf("tunnel_key must be exactly 64 hex characters (got %d) in %s.\n  Fix: generate a fresh 32-byte random hex key and paste the full 64-character value. Use the SAME value in client_config.json and server_config.json", len(key), path)
 	}
 	raw, err := hex.DecodeString(key)
 	if err != nil || len(raw) != 32 {
-		return nil, fmt.Errorf("tunnel_key in %s contains non-hex characters.\n  Valid characters are 0-9 and a-f. Generate a fresh key with 'bash scripts/gen-key.sh' and copy it carefully — no spaces, quotes, or extra newlines", path)
+		return nil, fmt.Errorf("tunnel_key in %s contains non-hex characters.\n  Valid characters are 0-9 and a-f. Generate a fresh 32-byte random hex key and copy it carefully - no spaces, quotes, or extra newlines", path)
+	}
+
+	transportMode, err := normalizeTransportMode(f.TransportMode)
+	if err != nil {
+		return nil, err
 	}
 
 	useFronting := len(relayURLs) == 0
@@ -339,6 +445,33 @@ func LoadClient(path string) (*Client, error) {
 	scriptAccounts := make([]string, len(relayURLs)) // direct relay_urls have no account labels
 	googleIP := ""
 	var sniHosts []string
+
+	allowAppsScript := transportMode == "auto" || transportMode == "apps_script"
+	allowDirectPost := transportMode == "auto" || transportMode == "direct_post"
+	allowDirectStream := transportMode == "auto" || transportMode == "direct_stream"
+
+	switch {
+	case transportMode == "direct_stream" && len(directStreamURLs) == 0:
+		return nil, fmt.Errorf("transport_mode direct_stream requires at least one direct_stream_urls entry in %s", path)
+	case transportMode == "direct_post" && len(relayURLs) == 0:
+		return nil, fmt.Errorf("transport_mode direct_post requires at least one relay_urls entry in %s", path)
+	case transportMode == "apps_script" && len(f.ScriptKeys) == 0:
+		return nil, fmt.Errorf("transport_mode apps_script requires script_keys in %s", path)
+	case !allowDirectStream && len(directStreamURLs) > 0:
+		return nil, fmt.Errorf("direct_stream_urls can only be used with transport_mode auto or direct_stream in %s", path)
+	case !allowDirectPost && len(relayURLs) > 0:
+		return nil, fmt.Errorf("relay_urls can only be used with transport_mode auto or direct_post in %s", path)
+	}
+
+	if len(relayURLs) > 0 {
+		useFronting = false
+	} else if allowAppsScript && len(f.ScriptKeys) > 0 {
+		useFronting = true
+	} else {
+		useFronting = false
+		scriptURLs = nil
+		scriptAccounts = nil
+	}
 
 	if useFronting {
 		googleHost := firstNonEmpty(f.GoogleHost, "216.239.38.120")
@@ -377,6 +510,9 @@ func LoadClient(path string) (*Client, error) {
 		}
 		scriptAccounts = accounts
 	}
+	if len(scriptURLs) == 0 && len(directStreamURLs) == 0 {
+		return nil, fmt.Errorf("no relay transport configured in %s: set direct_stream_urls, relay_urls, or script_keys", path)
+	}
 
 	socksUser := strings.TrimSpace(f.SocksUser)
 	socksPass := strings.TrimSpace(f.SocksPass)
@@ -387,9 +523,88 @@ func LoadClient(path string) (*Client, error) {
 	if f.CoalesceStepMs < 0 {
 		return nil, fmt.Errorf("coalesce_step_ms must be >= 0 in %s (got %d)", path, f.CoalesceStepMs)
 	}
+	performanceMode, err := normalizePerformanceMode(f.PerformanceMode)
+	if err != nil {
+		return nil, err
+	}
+	coalesceStep := f.CoalesceStepMs
+	idleSlotsPerBucket := f.IdleSlotsPerBucket
+	pollIdleSleepMs := f.PollIdleSleepMs
+	workersPerEndpoint := f.WorkersPerEndpoint
+	blacklistBaseMs := f.EndpointBlacklistBaseMs
+	blacklistMaxMs := f.EndpointBlacklistMaxMs
+	outageGraceMs := f.EndpointOutageGraceMs
+	maxRequestBytesPreEncode := f.MaxRequestBytesPreEncode
+	streamConnectTimeoutMs := f.StreamConnectTimeoutMs
+	streamPingIntervalMs := f.StreamPingIntervalMs
+	streamReconnectBackoffMs := f.StreamReconnectBackoffMs
+	switch performanceMode {
+	case "latency":
+		if pollIdleSleepMs == 0 {
+			pollIdleSleepMs = protocol.LatencyPollIdleSleepMs
+		}
+	case "throughput":
+		if coalesceStep == 0 {
+			coalesceStep = protocol.ThroughputCoalesceStepMs
+		}
+		if idleSlotsPerBucket == 0 {
+			idleSlotsPerBucket = protocol.ThroughputIdleSlotsPerBucket
+		}
+	}
+	if pollIdleSleepMs == 0 {
+		pollIdleSleepMs = protocol.DefaultPollIdleSleepMs
+	}
+	if workersPerEndpoint == 0 {
+		workersPerEndpoint = protocol.DefaultWorkersPerEndpoint
+	}
+	if idleSlotsPerBucket == 0 {
+		idleSlotsPerBucket = 1
+	}
+	if blacklistBaseMs == 0 {
+		blacklistBaseMs = protocol.DefaultEndpointBlacklistBaseMs
+	}
+	if blacklistMaxMs == 0 {
+		blacklistMaxMs = protocol.DefaultEndpointBlacklistMaxMs
+	}
+	if outageGraceMs == 0 {
+		outageGraceMs = protocol.DefaultEndpointOutageGraceMs
+	}
+	if maxRequestBytesPreEncode == 0 {
+		maxRequestBytesPreEncode = protocol.MaxRequestBytesPreEncode
+	}
+	if streamConnectTimeoutMs == 0 {
+		streamConnectTimeoutMs = protocol.DefaultStreamConnectTimeoutMs
+	}
+	if streamPingIntervalMs == 0 {
+		streamPingIntervalMs = protocol.DefaultStreamPingIntervalMs
+	}
+	if streamReconnectBackoffMs == 0 {
+		streamReconnectBackoffMs = protocol.DefaultStreamReconnectBackoffMs
+	}
+	if pollIdleSleepMs < 1 {
+		return nil, fmt.Errorf("poll_idle_sleep_ms must be >= 1 in %s (got %d)", path, pollIdleSleepMs)
+	}
+	if workersPerEndpoint < 1 {
+		return nil, fmt.Errorf("workers_per_endpoint must be >= 1 in %s (got %d)", path, workersPerEndpoint)
+	}
+	if blacklistBaseMs < 1 || blacklistMaxMs < blacklistBaseMs {
+		return nil, fmt.Errorf("endpoint blacklist TTLs must satisfy 1 <= base <= max in %s", path)
+	}
+	if outageGraceMs < 1 {
+		return nil, fmt.Errorf("endpoint_outage_grace_ms must be >= 1 in %s (got %d)", path, outageGraceMs)
+	}
+	if maxRequestBytesPreEncode < protocol.MaxFramePayload {
+		return nil, fmt.Errorf("max_request_bytes_pre_encode must be at least %d in %s", protocol.MaxFramePayload, path)
+	}
+	if streamConnectTimeoutMs < 1 || streamPingIntervalMs < 1 || streamReconnectBackoffMs < 1 {
+		return nil, fmt.Errorf("stream timeout values must be positive in %s", path)
+	}
+	if idleSlotsPerBucket < 0 || idleSlotsPerBucket > 3 {
+		return nil, fmt.Errorf("idle_slots_per_bucket must be 0-3 in %s (got %d)", path, idleSlotsPerBucket)
+	}
 	coalesceMax := 0
-	if f.CoalesceStepMs > 0 {
-		coalesceMax = f.CoalesceStepMs * 25
+	if coalesceStep > 0 {
+		coalesceMax = coalesceStep * 25
 	}
 
 	if f.IdleSlotsPerBucket < 0 || f.IdleSlotsPerBucket > 3 {
@@ -397,19 +612,32 @@ func LoadClient(path string) (*Client, error) {
 	}
 
 	c := Client{
-		ListenAddr:                  net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
-		GoogleIP:                    googleIP,
-		SNIHosts:                    sniHosts,
-		ScriptURLs:                  scriptURLs,
-		ScriptAccounts:              scriptAccounts,
-		UseFronting:                 useFronting,
-		AESKeyHex:                   key,
-		DebugTiming:                 f.DebugTiming,
-		SocksUser:                   socksUser,
-		SocksPass:                   socksPass,
-		CoalesceStepMs:              f.CoalesceStepMs,
-		CoalesceMaxMs:               coalesceMax,
-		IdleSlotsPerBucket:          f.IdleSlotsPerBucket,
+		ListenAddr:               net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
+		GoogleIP:                 googleIP,
+		SNIHosts:                 sniHosts,
+		ScriptURLs:               scriptURLs,
+		ScriptAccounts:           scriptAccounts,
+		DirectStreamURLs:         directStreamURLs,
+		UseFronting:              useFronting,
+		AESKeyHex:                key,
+		DebugTiming:              f.DebugTiming,
+		AutoTune:                 f.AutoTune,
+		SocksUser:                socksUser,
+		SocksPass:                socksPass,
+		PerformanceMode:          performanceMode,
+		TransportMode:            transportMode,
+		CoalesceStepMs:           coalesceStep,
+		CoalesceMaxMs:            coalesceMax,
+		IdleSlotsPerBucket:       idleSlotsPerBucket,
+		WorkersPerEndpoint:       workersPerEndpoint,
+		PollIdleSleepMs:          pollIdleSleepMs,
+		EndpointBlacklistBaseMs:  blacklistBaseMs,
+		EndpointBlacklistMaxMs:   blacklistMaxMs,
+		EndpointOutageGraceMs:    outageGraceMs,
+		MaxRequestBytesPreEncode: maxRequestBytesPreEncode,
+		StreamConnectTimeoutMs:   streamConnectTimeoutMs,
+		StreamPingIntervalMs:     streamPingIntervalMs,
+		StreamReconnectBackoffMs: streamReconnectBackoffMs,
 	}
 	return &c, nil
 }

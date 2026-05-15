@@ -50,6 +50,16 @@ func (s *Server) logStats() {
 		s.stats.rstSent.Load(),
 		s.stats.decodeFailures.Load(),
 	)
+	log.Printf("[stats] latency queue_wait[%s] encode[%s] decode[%s]",
+		s.stats.queueWait.Snapshot().StringMS(),
+		s.stats.encode.Snapshot().StringMS(),
+		s.stats.decode.Snapshot().StringMS(),
+	)
+	log.Printf("[stats] payload req={%s} resp={%s} wire_ratio={%s}",
+		s.stats.reqSize.String(),
+		s.stats.respSize.String(),
+		s.stats.wireRatio.String(),
+	)
 }
 
 // humanBytes formats a byte count as a short human-readable string. Mirrors

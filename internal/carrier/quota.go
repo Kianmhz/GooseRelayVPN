@@ -28,7 +28,7 @@ func nextQuotaReset(now time.Time) time.Time {
 	local := now.In(quotaResetTZ)
 	midnight := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, quotaResetTZ)
 	if !midnight.After(now) {
-		midnight = midnight.Add(24 * time.Hour)
+		midnight = time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, quotaResetTZ)
 	}
 	return midnight
 }
@@ -46,8 +46,13 @@ func (c *Client) touchDailyWindow(ep *relayEndpoint, now time.Time) (rolledOver 
 	if now.Before(ep.dailyResetAt) {
 		return false
 	}
+	expiredReset := ep.dailyResetAt
 	ep.dailyCount = 0
 	ep.dailyResetAt = nextQuotaReset(now)
+	ep.quotaExhaustedUntil = time.Time{}
+	if !ep.blacklistedTill.IsZero() && !ep.blacklistedTill.After(expiredReset) {
+		ep.blacklistedTill = time.Time{}
+	}
 	return true
 }
 

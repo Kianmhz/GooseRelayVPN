@@ -34,6 +34,23 @@ func TestDrainTx_EmitsSYNFirst(t *testing.T) {
 	}
 }
 
+func TestEnqueueTxPreallocatesModerateBuffer(t *testing.T) {
+	s := New(sid(0x12), "example.com:443", false)
+	s.EnqueueTx([]byte("hello"))
+
+	s.mu.Lock()
+	gotCap := cap(s.txBuf)
+	gotLen := len(s.txBuf)
+	s.mu.Unlock()
+
+	if gotLen != len("hello") {
+		t.Fatalf("txBuf len = %d, want %d", gotLen, len("hello"))
+	}
+	if gotCap < 64*1024 {
+		t.Fatalf("txBuf cap = %d, want at least 64KiB", gotCap)
+	}
+}
+
 func TestDrainTx_ChunksLargePayload(t *testing.T) {
 	s := New(sid(1), "x:1", false)
 	s.EnqueueTx(bytes.Repeat([]byte("A"), 250))
@@ -82,6 +99,39 @@ func TestDrainTxLimited_PartialAndResume(t *testing.T) {
 	}
 	if total != 250 {
 		t.Fatalf("total drained bytes %d", total)
+	}
+}
+
+func TestDrainTxLimitedByBudget_StopsAtByteBudgetAndResumesInOrder(t *testing.T) {
+	s := New(sid(9), "x:1", false)
+	s.EnqueueTx(bytes.Repeat([]byte("C"), 250))
+
+	first := s.DrainTxLimitedByBudget(100, 10, 150)
+	if len(first) != 2 {
+		t.Fatalf("want 2 frames on first drain, got %d", len(first))
+	}
+	if len(first[0].Payload) != 100 || len(first[1].Payload) != 50 {
+		t.Fatalf("first drain payload sizes = %d/%d, want 100/50", len(first[0].Payload), len(first[1].Payload))
+	}
+	if first[0].Seq != 0 || first[1].Seq != 1 {
+		t.Fatalf("unexpected seq in first drain: %d %d", first[0].Seq, first[1].Seq)
+	}
+	if !s.HasPendingTx() {
+		t.Fatal("expected pending tx after byte-limited drain")
+	}
+
+	second := s.DrainTxLimitedByBudget(100, 10, 150)
+	if len(second) != 1 {
+		t.Fatalf("want 1 frame on second drain, got %d", len(second))
+	}
+	if len(second[0].Payload) != 100 {
+		t.Fatalf("second drain payload size = %d, want 100", len(second[0].Payload))
+	}
+	if second[0].Seq != 2 {
+		t.Fatalf("unexpected seq in second drain: %d", second[0].Seq)
+	}
+	if s.HasPendingTx() {
+		t.Fatal("did not expect pending tx after draining all payload")
 	}
 }
 
@@ -141,6 +191,22 @@ func TestProcessRx_DuplicateDropped(t *testing.T) {
 	}
 }
 
+func TestProcessRx_ReorderOverflowClosesSession(t *testing.T) {
+	s := New(sid(0x44), "", false)
+	for i := 1; i <= rxReorderCap+1; i++ {
+		s.ProcessRx(&frame.Frame{SessionID: sid(0x44), Seq: uint64(i), Payload: []byte("future")})
+	}
+
+	select {
+	case _, ok := <-s.RxChan:
+		if ok {
+			t.Fatal("RxChan should close after reorder overflow")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for reorder overflow to close session")
+	}
+}
+
 func TestProcessRx_FINClosesRxChan(t *testing.T) {
 	s := New(sid(5), "", false)
 	s.ProcessRx(&frame.Frame{SessionID: sid(5), Seq: 0, Payload: []byte("hi")})
@@ -189,5 +255,20 @@ func TestOnTx_FiresOnEnqueue(t *testing.T) {
 	case <-notified:
 	case <-time.After(time.Second):
 		t.Fatal("OnTx not invoked")
+	}
+}
+
+func TestAbortClosesRxAndPreventsFurtherTx(t *testing.T) {
+	s := New(sid(0xA), "example.com:443", true)
+	s.EnqueueTx([]byte("before-abort"))
+
+	s.Abort()
+
+	if _, ok := <-s.RxChan; ok {
+		t.Fatal("RxChan should be closed after Abort")
+	}
+	s.EnqueueTx([]byte("after-abort"))
+	if frames := s.DrainTx(64 * 1024); len(frames) != 0 {
+		t.Fatalf("Abort should prevent further TX, got %d frame(s)", len(frames))
 	}
 }

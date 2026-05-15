@@ -53,12 +53,41 @@ func TestCryptoOpen_TamperedNonce(t *testing.T) {
 	}
 }
 
+func TestCryptoSealUsesUniqueNonces(t *testing.T) {
+	c := newTestCrypto(t)
+	a, err := c.Seal([]byte("hello"))
+	if err != nil {
+		t.Fatalf("seal a: %v", err)
+	}
+	b, err := c.Seal([]byte("hello"))
+	if err != nil {
+		t.Fatalf("seal b: %v", err)
+	}
+	if bytes.Equal(a[:12], b[:12]) {
+		t.Fatalf("nonce repeated: %x", a[:12])
+	}
+}
+
 func TestCryptoOpen_WrongKey(t *testing.T) {
 	a := newTestCrypto(t)
 	b, _ := NewCryptoFromHexKey(strings.Repeat("ff", 32))
 	env, _ := a.Seal([]byte("hello"))
 	if _, err := b.Open(env); err == nil {
 		t.Fatal("expected auth error on wrong key")
+	}
+}
+
+func TestCryptoSealAllocatesOnlyEnvelope(t *testing.T) {
+	c := newTestCrypto(t)
+	payload := bytes.Repeat([]byte("x"), 1024)
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		if _, err := c.Seal(payload); err != nil {
+			t.Fatalf("seal: %v", err)
+		}
+	})
+	if allocs > 1 {
+		t.Fatalf("Seal allocations = %.2f, want <= 1", allocs)
 	}
 }
 
@@ -103,6 +132,59 @@ func TestEncodeDecodeBatch_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeBatchBinary_RoundTrip(t *testing.T) {
+	c := newTestCrypto(t)
+	in := []*Frame{
+		{SessionID: sid(1), Seq: 0, Flags: FlagSYN, Target: "example.com:80", Payload: []byte("binary")},
+		{SessionID: sid(1), Seq: 1, Payload: []byte("payload")},
+	}
+	wantClient := [ClientIDLen]byte{9, 8, 7, 6}
+
+	body, err := EncodeBatchBinary(c, wantClient, in)
+	if err != nil {
+		t.Fatalf("encode binary: %v", err)
+	}
+	textBody, err := EncodeBatch(c, wantClient, in)
+	if err != nil {
+		t.Fatalf("encode text: %v", err)
+	}
+	if len(body) >= len(textBody) {
+		t.Fatalf("binary body len = %d, want smaller than base64 text len %d", len(body), len(textBody))
+	}
+	gotClient, out, err := DecodeBatchBinary(c, body)
+	if err != nil {
+		t.Fatalf("decode binary: %v", err)
+	}
+	if gotClient != wantClient {
+		t.Fatalf("clientID: got %x want %x", gotClient, wantClient)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("frame count = %d, want %d", len(out), len(in))
+	}
+	for i := range in {
+		if out[i].SessionID != in[i].SessionID || out[i].Seq != in[i].Seq || !bytes.Equal(out[i].Payload, in[i].Payload) {
+			t.Fatalf("frame %d mismatch", i)
+		}
+	}
+}
+
+func TestShouldAttemptCompressionSkipsHighEntropyPayload(t *testing.T) {
+	payload := make([]byte, 4096)
+	for i := range payload {
+		payload[i] = byte((i*251 + 17) & 0xff)
+	}
+	if shouldAttemptCompression(payload) {
+		t.Fatal("high-entropy payload should skip compression")
+	}
+}
+
+func TestShouldAttemptCompressionAllowsRepetitivePayload(t *testing.T) {
+	payload := bytes.Repeat([]byte("compress-me-"), 512)
+	if !shouldAttemptCompression(payload) {
+		t.Fatal("repetitive payload should attempt compression")
+	}
+}
+
 func TestDecodeBatch_EmptyBody(t *testing.T) {
 	c := newTestCrypto(t)
 	_, out, err := DecodeBatch(c, nil)
@@ -111,6 +193,19 @@ func TestDecodeBatch_EmptyBody(t *testing.T) {
 	}
 	if len(out) != 0 {
 		t.Fatalf("want 0 frames, got %d", len(out))
+	}
+}
+
+func TestReadAllLimitedRejectsExpandedPayload(t *testing.T) {
+	if _, err := readAllLimited(bytes.NewReader([]byte("abcdef")), 5); err == nil {
+		t.Fatal("readAllLimited succeeded for over-limit payload")
+	}
+	got, err := readAllLimited(bytes.NewReader([]byte("abcde")), 5)
+	if err != nil {
+		t.Fatalf("readAllLimited: %v", err)
+	}
+	if string(got) != "abcde" {
+		t.Fatalf("got %q, want abcde", got)
 	}
 }
 
