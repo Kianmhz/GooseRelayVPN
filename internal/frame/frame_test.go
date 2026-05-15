@@ -107,6 +107,37 @@ func TestFrameRoundTrip_ACK(t *testing.T) {
 	}
 }
 
+func TestAppendMarshalMatchesMarshalAndReusesDestination(t *testing.T) {
+	in := &Frame{
+		SessionID: sid(0x33),
+		Seq:       123,
+		Flags:     FlagSYN,
+		Target:    "example.org:443",
+		Payload:   []byte("payload"),
+	}
+	prefix := []byte("prefix:")
+	dst := make([]byte, len(prefix), 128)
+	copy(dst, prefix)
+
+	got, err := in.AppendMarshal(dst)
+	if err != nil {
+		t.Fatalf("append marshal: %v", err)
+	}
+	wantFrame, err := in.Marshal()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Equal(got[:len(prefix)], prefix) {
+		t.Fatalf("prefix changed: %q", got[:len(prefix)])
+	}
+	if !bytes.Equal(got[len(prefix):], wantFrame) {
+		t.Fatalf("appended frame mismatch")
+	}
+	if cap(got) != cap(dst) {
+		t.Fatalf("AppendMarshal allocated despite sufficient destination capacity")
+	}
+}
+
 func TestUnmarshal_ShortHeader(t *testing.T) {
 	if _, _, err := Unmarshal([]byte{1, 2, 3}); err == nil {
 		t.Fatal("expected error on short header")
