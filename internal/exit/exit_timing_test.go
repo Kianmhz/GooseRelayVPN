@@ -524,6 +524,56 @@ func TestDrainAll_RespectsByteBudget(t *testing.T) {
 	}
 }
 
+func TestDrainAll_CapsInitialResponseOnly(t *testing.T) {
+	s := mustExitTimingServer(t)
+	id := benchSessionID(777)
+	var owner [frame.ClientIDLen]byte
+	owner[0] = 0x77
+
+	payload := bytes.Repeat([]byte("x"), maxResponseBytesPreEncode)
+	sess := session.New(id, "x:1", false)
+	sess.EnqueueTx(payload)
+	s.sessions[id] = sess
+	s.sessionOwners[id] = owner
+	s.firstReply[id] = struct{}{}
+	s.txReady[id] = struct{}{}
+
+	frames, urgent := s.drainAll(owner, maxResponseBytesPreEncode)
+	if !urgent {
+		t.Fatal("first downstream response should be urgent")
+	}
+	firstBytes := sumFramePayloadBytes(frames)
+	if firstBytes == 0 {
+		t.Fatal("first drain returned no payload")
+	}
+	if firstBytes > s.initialResponseBytesPreEncode {
+		t.Fatalf("first response bytes = %d, want <= %d", firstBytes, s.initialResponseBytesPreEncode)
+	}
+	if _, stillFirst := s.firstReply[id]; stillFirst {
+		t.Fatal("firstReply marker was not cleared after first downstream drain")
+	}
+	if !sess.HasPendingTx() {
+		t.Fatal("test setup expected payload to remain after capped first response")
+	}
+
+	frames, urgent = s.drainAll(owner, maxResponseBytesPreEncode)
+	if urgent {
+		t.Fatal("second downstream response should not be urgent after firstReply is cleared")
+	}
+	secondBytes := sumFramePayloadBytes(frames)
+	if secondBytes <= s.initialResponseBytesPreEncode {
+		t.Fatalf("second response bytes = %d, want normal larger drain above %d", secondBytes, s.initialResponseBytesPreEncode)
+	}
+}
+
+func sumFramePayloadBytes(frames []*frame.Frame) int {
+	var total int
+	for _, f := range frames {
+		total += len(f.Payload)
+	}
+	return total
+}
+
 // BenchmarkExitRouteIncoming_NSessions measures the cost of routing a data
 // frame to one of N already-open sessions on the server. This surfaces any
 // regression in lock contention or per-frame routing work as session fan-out

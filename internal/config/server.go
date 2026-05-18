@@ -15,10 +15,11 @@ import (
 
 // Server is the VPS exit server config.
 type Server struct {
-	ListenAddr    string
-	AESKeyHex     string
-	DebugTiming   bool
-	UpstreamProxy string // optional socks5://host:port; when set, all outbound dials go through this proxy
+	ListenAddr                    string
+	AESKeyHex                     string
+	DebugTiming                   bool
+	UpstreamProxy                 string // optional socks5://host:port; when set, all outbound dials go through this proxy
+	InitialResponseBytesPreEncode int
 }
 
 type serverFile struct {
@@ -35,6 +36,10 @@ type serverFile struct {
 	// (e.g. Cloudflare WARP on socks5://127.0.0.1:40000). Useful when the VPS
 	// datacenter IP is blocked by certain sites.
 	UpstreamProxy string `json:"upstream_proxy"`
+
+	// Optional: cap the first downstream response for a newly opened session.
+	// 0 uses the server default.
+	InitialResponseBytesPreEncode int `json:"initial_response_bytes_pre_encode"`
 
 	// Legacy keys kept as fallback for existing deployments.
 	ListenAddr string `json:"listen_addr"`
@@ -104,12 +109,16 @@ func LoadServer(path string) (*Server, error) {
 		}
 		upstreamProxy = u.Host
 	}
+	if f.InitialResponseBytesPreEncode < 0 {
+		return nil, fmt.Errorf("initial_response_bytes_pre_encode must be >= 0")
+	}
 
 	c := Server{
-		ListenAddr:    net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
-		AESKeyHex:     key,
-		DebugTiming:   f.DebugTiming,
-		UpstreamProxy: upstreamProxy,
+		ListenAddr:                    net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
+		AESKeyHex:                     key,
+		DebugTiming:                   f.DebugTiming,
+		UpstreamProxy:                 upstreamProxy,
+		InitialResponseBytesPreEncode: f.InitialResponseBytesPreEncode,
 	}
 	return &c, nil
 }

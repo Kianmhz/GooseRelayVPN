@@ -31,11 +31,12 @@ func main() {
 	}
 
 	srv, err := exit.New(exit.Config{
-		ListenAddr:    cfg.ListenAddr,
-		AESKeyHex:     cfg.AESKeyHex,
-		DebugTiming:   cfg.DebugTiming,
-		UpstreamProxy: cfg.UpstreamProxy,
-		Version:       version,
+		ListenAddr:                    cfg.ListenAddr,
+		AESKeyHex:                     cfg.AESKeyHex,
+		DebugTiming:                   cfg.DebugTiming,
+		UpstreamProxy:                 cfg.UpstreamProxy,
+		InitialResponseBytesPreEncode: cfg.InitialResponseBytesPreEncode,
+		Version:                       version,
 	})
 	if err != nil {
 		log.Fatalf("exit: %v", err)

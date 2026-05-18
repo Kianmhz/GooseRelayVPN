@@ -96,6 +96,12 @@ const (
 	// last drained session.
 	maxResponseBytesPreEncode = 22 * 1024 * 1024
 
+	// initialResponseBytesPreEncode caps the first downstream response for a
+	// newly-opened session. Apps Script buffers full HTTP responses, so keeping
+	// the first file-download/header burst small improves browser-visible start
+	// time without reducing later bulk throughput.
+	initialResponseBytesPreEncode = 512 * 1024
+
 	// dialFailureBackoff is how long we suppress repeated SYN dial attempts to a
 	// target after a structural network/DNS failure.
 	dialFailureBackoff = 2 * time.Second
@@ -116,21 +122,23 @@ const (
 
 // Config is the VPS server's configuration.
 type Config struct {
-	ListenAddr    string // "0.0.0.0:8443"
-	AESKeyHex     string // 64-char hex
-	DebugTiming   bool   // when true, log per-session dial breakdown and first-read latency
-	UpstreamProxy string // optional "host:port" of a local SOCKS5 proxy (e.g. WARP on 127.0.0.1:40000)
-	Version       string // build version string (exposed in /healthz and version probe)
+	ListenAddr                    string // "0.0.0.0:8443"
+	AESKeyHex                     string // 64-char hex
+	DebugTiming                   bool   // when true, log per-session dial breakdown and first-read latency
+	UpstreamProxy                 string // optional "host:port" of a local SOCKS5 proxy (e.g. WARP on 127.0.0.1:40000)
+	InitialResponseBytesPreEncode int    // optional cap for first downstream response; <=0 uses default
+	Version                       string // build version string (exposed in /healthz and version probe)
 }
 
 // Server holds the per-process session state.
 type Server struct {
-	cfg         Config
-	aead        *frame.Crypto
-	dial        func(network, address string, timeout time.Duration) (net.Conn, error)
-	dns         *dnsCache
-	debugTiming bool
-	version     string
+	cfg                           Config
+	aead                          *frame.Crypto
+	dial                          func(network, address string, timeout time.Duration) (net.Conn, error)
+	dns                           *dnsCache
+	debugTiming                   bool
+	version                       string
+	initialResponseBytesPreEncode int
 
 	mu            sync.Mutex
 	sessions      map[[frame.SessionIDLen]byte]*session.Session
@@ -178,23 +186,28 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	dialFn := dialFunc(cfg.UpstreamProxy)
+	initialResponseCap := cfg.InitialResponseBytesPreEncode
+	if initialResponseCap <= 0 {
+		initialResponseCap = initialResponseBytesPreEncode
+	}
 	s := &Server{
-		cfg:           cfg,
-		aead:          aead,
-		dial:          dialFn,
-		dns:           newDNSCache(),
-		debugTiming:   cfg.DebugTiming,
-		version:       cfg.Version,
-		sessions:      make(map[[frame.SessionIDLen]byte]*session.Session),
-		sessionOwners: make(map[[frame.SessionIDLen]byte][frame.ClientIDLen]byte),
-		txReady:       make(map[[frame.SessionIDLen]byte]struct{}),
-		firstReply:    make(map[[frame.SessionIDLen]byte]struct{}),
-		upstreams:     make(map[[frame.SessionIDLen]byte]net.Conn),
-		lastActivity:  make(map[[frame.SessionIDLen]byte]time.Time),
-		dialFail:      make(map[string]time.Time),
-		pendingRSTs:   make(map[[frame.ClientIDLen]byte][]*frame.Frame),
-		pendingCtrl:   make(map[[frame.ClientIDLen]byte][]*frame.Frame),
-		activity:      make(map[[frame.ClientIDLen]byte]chan struct{}),
+		cfg:                           cfg,
+		aead:                          aead,
+		dial:                          dialFn,
+		dns:                           newDNSCache(),
+		debugTiming:                   cfg.DebugTiming,
+		version:                       cfg.Version,
+		initialResponseBytesPreEncode: initialResponseCap,
+		sessions:                      make(map[[frame.SessionIDLen]byte]*session.Session),
+		sessionOwners:                 make(map[[frame.SessionIDLen]byte][frame.ClientIDLen]byte),
+		txReady:                       make(map[[frame.SessionIDLen]byte]struct{}),
+		firstReply:                    make(map[[frame.SessionIDLen]byte]struct{}),
+		upstreams:                     make(map[[frame.SessionIDLen]byte]net.Conn),
+		lastActivity:                  make(map[[frame.SessionIDLen]byte]time.Time),
+		dialFail:                      make(map[string]time.Time),
+		pendingRSTs:                   make(map[[frame.ClientIDLen]byte][]*frame.Frame),
+		pendingCtrl:                   make(map[[frame.ClientIDLen]byte][]*frame.Frame),
+		activity:                      make(map[[frame.ClientIDLen]byte]chan struct{}),
 	}
 	s.upstreamReadPool.New = func() interface{} {
 		buf := make([]byte, upstreamReadBuf)
@@ -695,7 +708,14 @@ func (s *Server) drainAll(owner [frame.ClientIDLen]byte, byteBudget int) ([]*fra
 		if remaining < perSessionCap {
 			perSessionCap = remaining
 		}
-		frames := sess.DrainTxLimited(MaxFramePayload, perSessionCap)
+		maxPayload := MaxFramePayload
+		if _, isFirst := s.firstReply[id]; isFirst && perSessionCap > 0 {
+			firstPayload := (s.initialResponseBytesPreEncode + perSessionCap - 1) / perSessionCap
+			if firstPayload > 0 && firstPayload < maxPayload {
+				maxPayload = firstPayload
+			}
+		}
+		frames := sess.DrainTxLimited(maxPayload, perSessionCap)
 		// Only clear from txReady when fully drained. A partial drain (cap
 		// hit before all data + a trailing FIN could be emitted) needs to
 		// stay queued, otherwise the session is stranded with no path back
