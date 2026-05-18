@@ -40,6 +40,7 @@ function doPost(e) {
         payload: payload,
         muteHttpExceptions: true,
         followRedirects: false,
+        deadline: 30,  // seconds; long-poll window is kept below this for Apps Script stability
       });
       const status = resp.getResponseCode();
       const text = resp.getContentText();

@@ -323,15 +323,15 @@ func LoadClient(path string) (*Client, error) {
 	relayURLs = dedupeStrings(relayURLs)
 
 	key := strings.TrimSpace(f.TunnelKey)
-	if key == "" || key == "REPLACE_WITH_OUTPUT_OF_scripts_gen-key.sh" {
-		return nil, fmt.Errorf("tunnel_key is empty or still the placeholder text in %s.\n  Fix: generate a key with 'bash scripts/gen-key.sh' and paste the 64-character output into the tunnel_key field. The same value must be in server_config.json", path)
+	if key == "" || key == "REPLACE_WITH_64_HEX_CHARACTER_RANDOM_KEY" {
+		return nil, fmt.Errorf("tunnel_key is empty or still the placeholder text in %s.\n  Fix: generate a key with 'openssl rand -hex 32' and paste the 64-character output into the tunnel_key field. The same value must be in server_config.json", path)
 	}
 	if len(key) != 64 {
-		return nil, fmt.Errorf("tunnel_key must be exactly 64 hex characters (got %d) in %s.\n  Fix: generate a fresh key with 'bash scripts/gen-key.sh' and paste the full output. Use the SAME value in client_config.json and server_config.json", len(key), path)
+		return nil, fmt.Errorf("tunnel_key must be exactly 64 hex characters (got %d) in %s.\n  Fix: generate a fresh key with 'openssl rand -hex 32' and paste the full output. Use the SAME value in client_config.json and server_config.json", len(key), path)
 	}
 	raw, err := hex.DecodeString(key)
 	if err != nil || len(raw) != 32 {
-		return nil, fmt.Errorf("tunnel_key in %s contains non-hex characters.\n  Valid characters are 0-9 and a-f. Generate a fresh key with 'bash scripts/gen-key.sh' and copy it carefully — no spaces, quotes, or extra newlines", path)
+		return nil, fmt.Errorf("tunnel_key in %s contains non-hex characters.\n  Valid characters are 0-9 and a-f. Generate a fresh key with 'openssl rand -hex 32' and copy it carefully — no spaces, quotes, or extra newlines", path)
 	}
 
 	useFronting := len(relayURLs) == 0
