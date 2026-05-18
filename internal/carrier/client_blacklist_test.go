@@ -2,16 +2,28 @@ package carrier
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/kianmhz/GooseRelayVPN/internal/frame"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
 
 // TestEndpointFullRecoveryFromHighFailCount: a single successful response must
 // fully clear failCount and blacklistedTill, regardless of how badly the
@@ -135,6 +147,163 @@ func TestPickRelayEndpointAllBlacklistedRefuses(t *testing.T) {
 	}
 }
 
+func TestLocalNetworkOfflineClassificationAndBackoff(t *testing.T) {
+	wrapped := &url.Error{
+		Op:  "Post",
+		URL: "https://script.google.com/macros/s/test/exec",
+		Err: &net.OpError{
+			Op:  "dial",
+			Err: &os.SyscallError{Syscall: "connect", Err: syscall.ENETUNREACH},
+		},
+	}
+	if !isLocalNetworkOffline(wrapped) {
+		t.Fatal("wrapped ENETUNREACH dial error should be classified as local offline")
+	}
+	if isLocalNetworkOffline(errors.New("relay returned HTTP 500")) {
+		t.Fatal("generic relay/server failure must not be classified as local offline")
+	}
+
+	c, err := New(Config{
+		ScriptURLs: []string{"https://example.invalid/exec"},
+		AESKeyHex:  testKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	c.markEndpointLocalNetworkFailure(0)
+
+	c.endpointMu.Lock()
+	ep := c.endpoints[0]
+	c.endpointMu.Unlock()
+	if ep.failCount != 0 {
+		t.Fatalf("local offline failCount = %d, want 0 so standard backoff tiers do not ramp", ep.failCount)
+	}
+	if !ep.localNetworkOffline {
+		t.Fatal("localNetworkOffline flag not set")
+	}
+	remaining := time.Until(ep.blacklistedTill)
+	if remaining <= 0 || remaining > localNetworkOfflineBlacklistTTL+2*time.Second {
+		t.Fatalf("local offline blacklist remaining = %v, want short cap around %v", remaining, localNetworkOfflineBlacklistTTL)
+	}
+}
+
+func TestRecoveryProbeClearsOnlyLocalNetworkFailures(t *testing.T) {
+	c, err := New(Config{
+		ScriptURLs: []string{
+			"https://local-offline.example/exec",
+			"https://generic-failure.example/exec",
+		},
+		AESKeyHex: testKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	now := time.Now()
+	c.endpointMu.Lock()
+	c.endpoints[0].blacklistedTill = now.Add(time.Minute)
+	c.endpoints[0].localNetworkOffline = true
+	c.endpoints[1].blacklistedTill = now.Add(time.Minute)
+	c.endpoints[1].failCount = 7
+	c.endpointMu.Unlock()
+
+	cleared := c.resetLocalNetworkFailures()
+	if cleared != 1 {
+		t.Fatalf("resetLocalNetworkFailures cleared %d endpoint(s), want 1", cleared)
+	}
+
+	c.endpointMu.Lock()
+	first := c.endpoints[0]
+	second := c.endpoints[1]
+	c.endpointMu.Unlock()
+	if !first.blacklistedTill.IsZero() || first.localNetworkOffline {
+		t.Fatalf("local-offline endpoint was not fully reset: %+v", first)
+	}
+	if second.blacklistedTill.IsZero() || second.failCount != 7 || second.localNetworkOffline {
+		t.Fatalf("generic blacklist should be preserved, got: %+v", second)
+	}
+}
+
+func TestRecoveryProbeClearsLocalNetworkFailuresWhenNetworkReturns(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	c, err := New(Config{
+		ScriptURLs: []string{"https://local-offline.example/exec"},
+		AESKeyHex:  testKeyHex,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	c.recoveryProbeAddr = ln.Addr().String()
+	c.endpointMu.Lock()
+	c.endpoints[0].blacklistedTill = time.Now().Add(time.Minute)
+	c.endpoints[0].localNetworkOffline = true
+	c.endpointMu.Unlock()
+
+	if !c.runEndpointRecoveryProbeOnce(context.Background()) {
+		t.Fatal("recovery probe did not report a successful reset")
+	}
+	c.endpointMu.Lock()
+	ep := c.endpoints[0]
+	c.endpointMu.Unlock()
+	if !ep.blacklistedTill.IsZero() || ep.failCount != 0 || ep.localNetworkOffline {
+		t.Fatalf("local network recovery did not clear transient backoff: %+v", ep)
+	}
+}
+
+func TestPollOnceMarksOnlyDoErrorsAsLocalNetworkFailures(t *testing.T) {
+	offlineErr := &net.OpError{
+		Op:  "dial",
+		Err: &os.SyscallError{Syscall: "connect", Err: syscall.ENETUNREACH},
+	}
+	c, err := New(Config{ScriptURLs: []string{"http://offline.example/exec"}, AESKeyHex: testKeyHex})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	c.httpClients = []*http.Client{{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, offlineErr
+		}),
+	}}
+	c.pollOnce(context.Background())
+	c.endpointMu.Lock()
+	local := c.endpoints[0]
+	c.endpointMu.Unlock()
+	if local.failCount != 0 || !local.localNetworkOffline {
+		t.Fatalf("Do dial error should use local offline backoff, got failCount=%d local=%v", local.failCount, local.localNetworkOffline)
+	}
+
+	c2, err := New(Config{ScriptURLs: []string{"http://server-error.example/exec"}, AESKeyHex: testKeyHex})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	c2.httpClients = []*http.Client{{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Body:       io.NopCloser(strings.NewReader("server error")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}}
+	c2.pollOnce(context.Background())
+	c2.endpointMu.Lock()
+	generic := c2.endpoints[0]
+	c2.endpointMu.Unlock()
+	if generic.failCount == 0 || generic.localNetworkOffline {
+		t.Fatalf("HTTP 500 should use normal endpoint failure, got failCount=%d local=%v", generic.failCount, generic.localNetworkOffline)
+	}
+}
+
 // TestPollOnce_AllBlacklistedSendsNoTraffic: integration check that no HTTP
 // request goes out when every endpoint is blacklisted. Before the fix, the
 // carrier kept POSTing to the soonest-expiring endpoint at the idle-backoff
@@ -191,13 +360,13 @@ func TestPollOnce_AllBlacklistedSendsNoTraffic(t *testing.T) {
 // many decoded frames it has seen after the outage ended, which is the signal
 // for whether the carrier retransmitted dropped frames.
 type blacklistHammerServer struct {
-	t                  *testing.T
-	aead               *frame.Crypto
-	hits               atomic.Int64
-	outage             atomic.Bool
-	framesAfterOutage  atomic.Int64
-	rxSeqMu            sync.Mutex
-	rxSeq              map[[frame.SessionIDLen]byte]uint64
+	t                 *testing.T
+	aead              *frame.Crypto
+	hits              atomic.Int64
+	outage            atomic.Bool
+	framesAfterOutage atomic.Int64
+	rxSeqMu           sync.Mutex
+	rxSeq             map[[frame.SessionIDLen]byte]uint64
 }
 
 func newBlacklistHammerServer(t *testing.T, aead *frame.Crypto) *blacklistHammerServer {
