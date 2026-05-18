@@ -20,6 +20,38 @@ import (
 
 const exitTimingTestKeyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) {
+	return 0, errors.New("reader should not be called")
+}
+
+func TestReadTunnelRequestBodyBoundsAndPreallocates(t *testing.T) {
+	_, err := readTunnelRequestBody(bytes.NewReader([]byte("abcdef")), -1, 5)
+	if err == nil {
+		t.Fatal("readTunnelRequestBody succeeded for over-limit unknown-length body")
+	}
+	if !errors.Is(err, errRequestTooLarge) {
+		t.Fatalf("readTunnelRequestBody err = %v, want errRequestTooLarge", err)
+	}
+
+	_, err = readTunnelRequestBody(errReader{}, 6, 5)
+	if err == nil {
+		t.Fatal("readTunnelRequestBody succeeded for over-limit Content-Length")
+	}
+	if !errors.Is(err, errRequestTooLarge) {
+		t.Fatalf("readTunnelRequestBody err = %v, want errRequestTooLarge", err)
+	}
+
+	got, err := readTunnelRequestBody(bytes.NewReader([]byte("abcde")), int64(len("abcde")), 5)
+	if err != nil {
+		t.Fatalf("readTunnelRequestBody: %v", err)
+	}
+	if string(got) != "abcde" {
+		t.Fatalf("readTunnelRequestBody = %q, want abcde", got)
+	}
+}
+
 func mustExitTimingServer(tb testing.TB) *Server {
 	tb.Helper()
 	s, err := New(Config{ListenAddr: "127.0.0.1:0", AESKeyHex: exitTimingTestKeyHex})

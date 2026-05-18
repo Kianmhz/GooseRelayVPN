@@ -1,7 +1,9 @@
 package carrier
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,32 @@ import (
 )
 
 const testKeyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+type carrierErrReader struct{}
+
+func (carrierErrReader) Read([]byte) (int, error) {
+	return 0, errors.New("reader should not be called")
+}
+
+func TestReadRelayResponseBodyBoundsAndPreallocates(t *testing.T) {
+	_, err := readRelayResponseBody(bytes.NewReader([]byte("abcdef")), -1, 5)
+	if err == nil {
+		t.Fatal("readRelayResponseBody succeeded for over-limit unknown-length body")
+	}
+
+	_, err = readRelayResponseBody(carrierErrReader{}, 6, 5)
+	if err == nil {
+		t.Fatal("readRelayResponseBody succeeded for over-limit Content-Length")
+	}
+
+	got, err := readRelayResponseBody(bytes.NewReader([]byte("abcde")), int64(len("abcde")), 5)
+	if err != nil {
+		t.Fatalf("readRelayResponseBody: %v", err)
+	}
+	if string(got) != "abcde" {
+		t.Fatalf("readRelayResponseBody = %q, want abcde", got)
+	}
+}
 
 // echoServer decodes the incoming batch, echoes each frame's payload back
 // (with the SYN bit cleared and seq reset per session), and returns it.

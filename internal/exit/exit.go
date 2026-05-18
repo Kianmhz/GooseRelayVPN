@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -112,7 +113,36 @@ const (
 
 	// idleGCInterval is how often the cleanup loop scans for orphaned sessions.
 	idleGCInterval = 60 * time.Second
+
+	// maxRequestBodyBytes caps the encrypted/base64 POST body accepted by
+	// /tunnel. Keep this above the largest current client batch envelope while
+	// still rejecting accidental or hostile unbounded uploads before decoding.
+	maxRequestBodyBytes = 64 * 1024 * 1024
 )
+
+var errRequestTooLarge = errors.New("tunnel request too large")
+
+func readTunnelRequestBody(r io.Reader, contentLength int64, limit int) ([]byte, error) {
+	if contentLength > int64(limit) {
+		return nil, fmt.Errorf("%w (%d bytes > %d)", errRequestTooLarge, contentLength, limit)
+	}
+	if contentLength >= 0 {
+		body := make([]byte, int(contentLength))
+		if _, err := io.ReadFull(r, body); err != nil {
+			return nil, err
+		}
+		return body, nil
+	}
+	lr := &io.LimitedReader{R: r, N: int64(limit) + 1}
+	body, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > limit {
+		return nil, fmt.Errorf("%w (%d bytes > %d)", errRequestTooLarge, len(body), limit)
+	}
+	return body, nil
+}
 
 // Config is the VPS server's configuration.
 type Config struct {
@@ -274,10 +304,14 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.stats.requests.Add(1)
-	body, err := io.ReadAll(r.Body)
+	body, err := readTunnelRequestBody(r.Body, r.ContentLength, maxRequestBodyBytes)
 	if err != nil {
 		log.Printf("[exit] read body: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
+		if errors.Is(err, errRequestTooLarge) {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+		}
 		return
 	}
 

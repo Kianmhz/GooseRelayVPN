@@ -67,6 +67,28 @@ const (
 	endpointBlacklistMaxTTL  = 1 * time.Hour
 )
 
+func readRelayResponseBody(r io.Reader, contentLength int64, limit int) ([]byte, error) {
+	if contentLength > int64(limit) {
+		return nil, fmt.Errorf("relay response too large (%d bytes > %d)", contentLength, limit)
+	}
+	if contentLength >= 0 {
+		body := make([]byte, int(contentLength))
+		if _, err := io.ReadFull(r, body); err != nil {
+			return nil, err
+		}
+		return body, nil
+	}
+	lr := &io.LimitedReader{R: r, N: int64(limit) + 1}
+	body, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > limit {
+		return nil, fmt.Errorf("relay response too large (%d bytes > %d)", len(body), limit)
+	}
+	return body, nil
+}
+
 // Config bundles everything the carrier needs to talk to the relay.
 type Config struct {
 	ScriptURLs    []string // one or more full https://script.google.com/macros/s/.../exec URLs
@@ -163,7 +185,7 @@ type Client struct {
 	numWorkers         int // (workersPerEndpoint + idleSlotsPerBucket - 1) × bucketCount
 	bucketCount        int // distinct account labels in endpoints; unlabeled all share one bucket
 	idleSlotsPerBucket int // resolved from Config.IdleSlotsPerBucket, default 1
-	clientVersion     string
+	clientVersion      string
 
 	// clientID is a random 16-byte identifier minted once per process. It is
 	// embedded in every encrypted batch so the server can route downstream
@@ -587,7 +609,7 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 			return false
 		}
 
-		respBody, readErr := io.ReadAll(resp.Body)
+		respBody, readErr := readRelayResponseBody(resp.Body, resp.ContentLength, maxRelayResponseBodyBytes)
 		_ = resp.Body.Close()
 		if readErr != nil {
 			c.markEndpointFailure(endpointIdx)
