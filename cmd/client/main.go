@@ -133,10 +133,21 @@ const gooseBanner = `
 func main() {
 	configPath := flag.String("config", "client_config.json", "path to client config JSON")
 	showVersion := flag.Bool("version", false, "show version and exit")
+	dumpDiag := flag.Bool("dump-diag", false, "write a redacted diagnostics zip and exit")
+	diagOutput := flag.String("diag-output", "", "path for --dump-diag output (default: goose-diagnostics-YYYYMMDD-HHMMSS.zip)")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Println(version)
+		return
+	}
+	if *dumpDiag {
+		out, err := writeDiagnosticsZip(*diagOutput, *configPath, version)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "diagnostics failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("diagnostics written to %s\n", out)
 		return
 	}
 
