@@ -263,3 +263,37 @@ func TestRollbackDrain_PreservesConcurrentEnqueue(t *testing.T) {
 		t.Fatalf("merged payload: got %q want %q", got, want)
 	}
 }
+
+// TestEnqueueInitialData_PreservesOrderAcrossMultipleCalls catches the regression
+// where EnqueueInitialData prepended (instead of appending) while synNeeded was
+// true. The SOCKS5 adapter calls this on every Write, and a fast local writer
+// can fit many calls between session creation and the SYN drain. Prepend
+// reversed byte order on the wire; for any protocol whose first bytes carry
+// framing (TLS records, HTTP request lines, length prefixes), the upstream
+// would either error or parse garbage. The bench harness's sized upload sink
+// silently masked this by ACKing on a 0-length body when the body's leading
+// zeros were read as the size header, producing wildly optimistic upload
+// throughput measurements.
+func TestEnqueueInitialData_PreservesOrderAcrossMultipleCalls(t *testing.T) {
+	s := New(sid(10), "example.com:443", true)
+
+	// Simulate a SOCKS5 writer calling Write multiple times before the
+	// carrier's poll worker drains the SYN: a length-prefix header followed
+	// by body chunks. The order matters; reverse order would put the body
+	// before the header and the upstream would misparse.
+	s.EnqueueInitialData([]byte("HDR_"))
+	s.EnqueueInitialData([]byte("body_chunk_1_"))
+	s.EnqueueInitialData([]byte("body_chunk_2"))
+
+	frames := s.DrainTx(64 * 1024)
+	if len(frames) != 1 {
+		t.Fatalf("want 1 bundled frame, got %d", len(frames))
+	}
+	if !frames[0].HasFlag(frame.FlagSYN) {
+		t.Fatal("first frame missing SYN")
+	}
+	want := []byte("HDR_body_chunk_1_body_chunk_2")
+	if !bytes.Equal(frames[0].Payload, want) {
+		t.Fatalf("payload ordering corrupt: got %q want %q", frames[0].Payload, want)
+	}
+}

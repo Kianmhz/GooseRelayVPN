@@ -149,8 +149,22 @@ func (s *Session) EnqueueTx(data []byte) {
 	}
 }
 
-// EnqueueInitialData prepends data to the tx buffer if the SYN hasn't been sent
-// yet. Used by the connect_data optimization.
+// EnqueueInitialData appends data to the tx buffer while synNeeded is still
+// true, so the first DrainTx call bundles it into the SYN frame's payload
+// (the connect_data optimization — saves one round-trip on every TLS
+// handshake and HTTP request).
+//
+// Previously this prepended, on the assumption it'd be called once before
+// any other write. But the SOCKS5 adapter calls it on every Write, and the
+// local write loop is frequently faster than poll workers — multiple calls
+// land before the SYN drains, and prepending REVERSES byte order. For a
+// payload whose first bytes carry framing/length (a TLS record header, an
+// HTTP request line, the bench harness's 8-byte size prefix), reordering
+// silently corrupts the upstream stream. The bug also rendered every
+// upload-throughput benchmark we have meaningless: with a size-prefixed
+// payload of zeros, the upstream parsed a body chunk's leading zeros as
+// "expect 0 bytes" and ACKed immediately, making upload look ~5× faster
+// than it actually was.
 func (s *Session) EnqueueInitialData(data []byte) {
 	s.mu.Lock()
 	if !s.synNeeded {
@@ -159,8 +173,7 @@ func (s *Session) EnqueueInitialData(data []byte) {
 		s.EnqueueTx(data)
 		return
 	}
-	// Prepend to txBuf so it's picked up by the first DrainTx call.
-	s.txBuf = append(data, s.txBuf...)
+	s.txBuf = append(s.txBuf, data...)
 	if s.firstQueuedAt.IsZero() {
 		s.firstQueuedAt = time.Now()
 	}
