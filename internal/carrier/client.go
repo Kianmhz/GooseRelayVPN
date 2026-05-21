@@ -236,7 +236,7 @@ type relayEndpoint struct {
 // each configured script URL. Total workers = workersPerEndpoint × len(endpoints).
 // Scaling with endpoint count means adding more deployment IDs increases
 // parallelism rather than just spreading the same fixed pool thinner.
-const workersPerEndpoint = 4
+const workersPerEndpoint = 3
 
 // waker is a broadcast notifier: Broadcast() wakes all goroutines currently
 // blocked on C() simultaneously, unlike a buffered chan which only wakes one.
