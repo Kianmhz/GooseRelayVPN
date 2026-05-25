@@ -17,14 +17,34 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kianmhz/GooseRelayVPN/internal/protocol"
 	"golang.org/x/net/http2"
 )
 
-// frontedProbeLegacyOKBody is what apps_script/Code.gs returned from doGet
-// before v1.4. Modern deployments return JSON instead (see
-// frontedProbeOKJSON); both are accepted to stay compatible with users who
-// haven't redeployed Code.gs in a while.
-const frontedProbeLegacyOKBody = "GooseRelay forwarder OK"
+const frontedProbeOKBody = "GooseRelay forwarder OK"
+
+const (
+	frontedH2ReadIdleTimeout = 12 * time.Second
+	frontedH2PingTimeout     = 8 * time.Second
+	frontedProbeMaxBody      = 4 * 1024
+)
+
+func NewDirectClients(pollTimeout time.Duration, workers int) []*http.Client {
+	if workers <= 0 {
+		workers = workersPerEndpoint
+	}
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		DialContext:           dialer.DialContext,
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   workers * 4,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 0,
+		DisableCompression:    true,
+	}
+	return []*http.Client{{Transport: transport, Timeout: pollTimeout}}
+}
 
 // FrontingConfig describes how to reach script.google.com without revealing
 // the real Host to a passive on-path observer: dial GoogleIP, do a TLS
@@ -33,27 +53,31 @@ const frontedProbeLegacyOKBody = "GooseRelay forwarder OK"
 // Script 302 redirect to script.googleusercontent.com correctly).
 //
 // Multiple SNIHosts are supported: each creates an independent HTTP client
-// with its own connection pool, which maps to a separate TLS SNI value and
-// therefore a separate per-domain throttle bucket on the Google CDN. Requests
-// are distributed across clients in round-robin order.
+// with its own connection pool and a separate TLS SNI value. This can help on
+// networks that treat Google front names differently, but it is empirical and
+// not a Google-documented throttle guarantee. Requests are distributed across
+// clients in round-robin order.
 type FrontingConfig struct {
-	GoogleIP string   // "ip:443"
-	SNIHosts []string // e.g. ["www.google.com", "mail.google.com", "accounts.google.com"]
+	GoogleIP    string   // "ip:443"
+	SNIHosts    []string // e.g. ["www.google.com", "mail.google.com", "accounts.google.com"]
+	HTTPVersion string   // auto, h1, or h2
 }
 
 // NewFrontedClients returns one *http.Client per SNI host in cfg.SNIHosts.
 // Each client has an independent transport/connection-pool so requests to
-// different SNI names are genuinely separate TLS sessions, each consuming
-// its own throttle bucket.
+// different SNI names are genuinely separate TLS sessions.
 //
 // pollTimeout is the per-request ceiling; it should comfortably exceed the
-// server's long-poll window (we use ~25 s).
+// server's long-poll window (the latency profile defaults to ~6 s).
 //
 // Each SNI gets its own tls.ClientSessionCache. A ticket from one Google
 // edge backend (e.g. www.google.com) is not valid for another (e.g.
 // mail.google.com) because they terminate at different fronts, so a
 // shared cache produces no resumes — only same-SNI reuse helps.
-func NewFrontedClients(cfg FrontingConfig, pollTimeout time.Duration, probeURL string) []*http.Client {
+func NewFrontedClients(cfg FrontingConfig, pollTimeout time.Duration, probeURL string, workers int) []*http.Client {
+	if workers <= 0 {
+		workers = workersPerEndpoint
+	}
 	hosts := cfg.SNIHosts
 	if len(hosts) == 0 {
 		hosts = []string{"www.google.com"}
@@ -66,13 +90,13 @@ func NewFrontedClients(cfg FrontingConfig, pollTimeout time.Duration, probeURL s
 	}
 	clients := make([]*http.Client, len(hosts))
 	for i, sni := range hosts {
-		clients[i] = newFrontedClient(cfg.GoogleIP, sni, pollTimeout, caches[sni])
+		clients[i] = newFrontedClient(cfg.GoogleIP, sni, pollTimeout, caches[sni], cfg.HTTPVersion, workers)
 	}
 	hosts, clients = filterFrontedClientsByProbe(hosts, clients, probeURL)
 	// Best-effort: warm each SNI's TLS session in the background so the
 	// first real poll resumes (saves ~140 ms TLS handshake per cold conn).
 	// Zero Apps Script executions consumed; failures are silently ignored.
-	prewarmFrontedClients(cfg.GoogleIP, hosts, caches)
+	prewarmFrontedClients(cfg.GoogleIP, hosts, caches, cfg.HTTPVersion)
 	return clients
 }
 
@@ -151,7 +175,7 @@ func probeFrontedClients(hosts []string, clients []*http.Client, probeURL string
 					res.err = err
 					continue
 				}
-				body, readErr := io.ReadAll(resp.Body)
+				body, readErr := readFrontedProbeBody(resp.Body)
 				_ = resp.Body.Close()
 				if readErr != nil {
 					cancel()
@@ -177,25 +201,50 @@ func probeFrontedClients(hosts []string, clients []*http.Client, probeURL string
 	return results
 }
 
+func readFrontedProbeBody(r io.Reader) ([]byte, error) {
+	lr := &io.LimitedReader{R: r, N: frontedProbeMaxBody + 1}
+	body, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > frontedProbeMaxBody {
+		return nil, fmt.Errorf("probe body too large (%d bytes > %d)", len(body), frontedProbeMaxBody)
+	}
+	return body, nil
+}
+
 func validateFrontedProbeResponse(statusCode int, body []byte) error {
 	if statusCode != http.StatusOK {
 		return fmt.Errorf("unexpected probe status %d", statusCode)
 	}
-	trimmed := strings.TrimSpace(string(body))
-	// Modern Code.gs (>=v1.4) returns JSON like
-	// {"ok":true,"date":"2026-05-12","count":1315,"version":1,"protocol":1}.
-	// Legacy deployments still return the plain "GooseRelay forwarder OK"
-	// string; accept both so an out-of-date Code.gs doesn't trip the probe.
-	if trimmed == frontedProbeLegacyOKBody {
+	trimmed := bytesTrimSpaceASCII(body)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var stats scriptStatsResponse
+		if err := json.Unmarshal(trimmed, &stats); err != nil {
+			return fmt.Errorf("unexpected probe JSON: %w", err)
+		}
+		if !stats.OK {
+			return fmt.Errorf("probe JSON reported ok=false")
+		}
+		if stats.Protocol != protocol.ProtocolVersion {
+			return fmt.Errorf("probe protocol mismatch: script=%d client=%d", stats.Protocol, protocol.ProtocolVersion)
+		}
 		return nil
 	}
-	var jsonBody struct {
-		OK bool `json:"ok"`
+	if strings.TrimSpace(string(body)) != frontedProbeOKBody {
+		return fmt.Errorf("unexpected probe body %q", strings.TrimSpace(string(body)))
 	}
-	if err := json.Unmarshal([]byte(trimmed), &jsonBody); err == nil && jsonBody.OK {
-		return nil
+	return nil
+}
+
+func bytesTrimSpaceASCII(b []byte) []byte {
+	for len(b) > 0 && b[0] <= ' ' {
+		b = b[1:]
 	}
-	return fmt.Errorf("unexpected probe body %q", trimmed)
+	for len(b) > 0 && b[len(b)-1] <= ' ' {
+		b = b[:len(b)-1]
+	}
+	return b
 }
 
 func selectFrontedClientIndexes(results []frontedProbeResult) []int {
@@ -283,7 +332,7 @@ func logFrontedProbeDecision(results []frontedProbeResult, keep []int) {
 			continue
 		}
 		if res.err != nil {
-			log.Printf("[fronting] startup probe %s sni=%s err=%v", action, res.host, res.err)
+			log.Printf("[fronting] startup probe %s sni=%s err=%s", action, res.host, safeLogError(res.err))
 			continue
 		}
 		log.Printf("[fronting] startup probe %s sni=%s no-successful-samples", action, res.host)
@@ -300,7 +349,7 @@ func logFrontedProbeDecision(results []frontedProbeResult, keep []int) {
 // with a short deadline; the read errors out on deadline but by then the
 // crypto/tls layer has consumed the post-handshake message and stored the
 // ticket in the cache.
-func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string]tls.ClientSessionCache) {
+func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string]tls.ClientSessionCache, httpVersion string) {
 	const (
 		dialTimeout   = 3 * time.Second
 		ticketWindow  = 500 * time.Millisecond
@@ -327,7 +376,7 @@ func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string
 				ClientSessionCache: cache,
 				// Match the real http.Transport ALPN so the resumed
 				// session is usable by HTTP/2 in the actual poll.
-				NextProtos: []string{"h2", "http/1.1"},
+				NextProtos: frontedNextProtos(httpVersion),
 			})
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				return
@@ -346,8 +395,20 @@ func prewarmFrontedClients(googleIP string, sniHosts []string, caches map[string
 
 // newFrontedClient builds a single *http.Client that dials googleIP and
 // presents sniHost in the TLS handshake.
-func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessionCache tls.ClientSessionCache) *http.Client {
+func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessionCache tls.ClientSessionCache, httpVersion string, workers int) *http.Client {
+	if workers <= 0 {
+		workers = workersPerEndpoint
+	}
+	idleConnsPerHost := workers * 2
+	if idleConnsPerHost < 2 {
+		idleConnsPerHost = 2
+	}
+	maxIdleConns := 16
+	if idleConnsPerHost > maxIdleConns {
+		maxIdleConns = idleConnsPerHost
+	}
 	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	httpVersion = normalizeFrontedHTTPVersion(httpVersion)
 
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -367,15 +428,15 @@ func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessi
 			// Pin ALPN so the resumed session matches the prewarm dial.
 			// (The TLS 1.3 resumption ticket is bound to ALPN; mismatched
 			// NextProtos causes the server to fall back to a full handshake.)
-			NextProtos: []string{"h2", "http/1.1"},
+			NextProtos: frontedNextProtos(httpVersion),
 		},
-		ForceAttemptHTTP2: true,
-		MaxIdleConns:      16,
+		ForceAttemptHTTP2: httpVersion != "h1",
+		MaxIdleConns:      maxIdleConns,
 		// Default MaxIdleConnsPerHost is 2, which forces idle h1 conns to be
 		// recycled between poll workers when ALPN downgrades or the server
 		// closes h2 streams. Pin it to roughly the worker count per endpoint
 		// so each worker can keep its own warm conn.
-		MaxIdleConnsPerHost: workersPerEndpoint * 2,
+		MaxIdleConnsPerHost: idleConnsPerHost,
 		// Larger HTTP read/write buffers cut syscall count on bulk batch
 		// bodies (server can return up to ~12 MB per poll under busy
 		// fan-out: 144 frames × 256 KB max payload, base64-expanded).
@@ -383,25 +444,57 @@ func newFrontedClient(googleIP, sniHost string, pollTimeout time.Duration, sessi
 		ReadBufferSize:        64 * 1024,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		ExpectContinueTimeout: 0,
 	}
 
 	// Configure HTTP/2 so the long-lived h2 connection sends pings and detects
 	// black-holed peers quickly. Without ReadIdleTimeout, a dead h2 conn can
 	// linger until the kernel's TCP keepalive fires (~2 hours by default),
 	// leaking poll worker time as in-flight requests stall.
-	if h2t, err := http2.ConfigureTransports(transport); err == nil && h2t != nil {
-		h2t.ReadIdleTimeout = 30 * time.Second
-		h2t.PingTimeout = 15 * time.Second
-		// Raise the max DATA frame size we are willing to receive from 16 KiB
-		// (spec default) to 1 MiB. Each DATA frame carries a 9-byte header,
-		// so on a long bulk download (Apps Script gateway streaming a video
-		// chunk back) the framing overhead drops by ~64× and the receiver
-		// makes ~64× fewer Read syscalls per MiB. Stream/conn flow control
-		// windows in golang.org/x/net/http2 already default to 4 MiB / 1 GiB,
-		// so the actual throughput cap is RTT-bound, not window-bound.
-		h2t.MaxReadFrameSize = 1 << 20
+	if httpVersion != "h1" {
+		if h2t, err := configureFrontedHTTP2(transport); err == nil && h2t != nil {
+			h2t.ReadIdleTimeout = frontedH2ReadIdleTimeout
+			h2t.PingTimeout = frontedH2PingTimeout
+			// Explicitly allow 1 MiB DATA frames on HTTP/2. Some x/net/http2
+			// versions already default this high; keeping it explicit avoids
+			// accidentally falling back to the 16 KiB HTTP/2 spec default.
+			h2t.MaxReadFrameSize = 1 << 20
+			if httpVersion == "h2" {
+				transport.TLSClientConfig.NextProtos = []string{"h2"}
+			}
+		}
 	}
 
 	return &http.Client{Transport: transport, Timeout: pollTimeout}
+}
+
+func normalizeFrontedHTTPVersion(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "h1", "h2":
+		return strings.TrimSpace(strings.ToLower(mode))
+	default:
+		return "auto"
+	}
+}
+
+func frontedNextProtos(httpVersion string) []string {
+	switch normalizeFrontedHTTPVersion(httpVersion) {
+	case "h1":
+		return []string{"http/1.1"}
+	case "h2":
+		return []string{"h2"}
+	default:
+		return []string{"h2", "http/1.1"}
+	}
+}
+
+func configureFrontedHTTP2(transport *http.Transport) (*http2.Transport, error) {
+	h2t, err := http2.ConfigureTransports(transport)
+	if err != nil || h2t == nil {
+		return h2t, err
+	}
+	h2t.ReadIdleTimeout = frontedH2ReadIdleTimeout
+	h2t.PingTimeout = frontedH2PingTimeout
+	h2t.MaxReadFrameSize = 1 << 20
+	return h2t, nil
 }

@@ -9,8 +9,35 @@ permissions:
   contents: write
 
 jobs:
+  preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+          check-latest: true
+      - name: Verify modules
+        run: go mod verify
+      - name: Test
+        run: go test -count=1 -timeout 120s ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          staticcheck ./...
+      - name: Race test
+        run: go test -race -count=1 -timeout 180s ./...
+      - name: Govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+      - name: Bench smoke
+        run: bash bench/bench.sh --smoke --transport direct_stream --scenario mixed_stream_bad_syn_bulk
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: preflight
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -37,7 +64,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.26.3'
 
       - name: Build binaries
         shell: bash
@@ -59,6 +86,8 @@ jobs:
           mkdir -p "dist/$CLIENT_NAME"
           go build -trimpath -ldflags "$LDFLAGS" -o "dist/$CLIENT_NAME/goose-client${SUFFIX}" ./cmd/client
           cp client_config.example.json "dist/$CLIENT_NAME/"
+          mkdir -p "dist/$CLIENT_NAME/apps_script"
+          cp apps_script/Code.gs "dist/$CLIENT_NAME/apps_script/"
 
           # --- server ---
           if [ "$GOOS" != "android" ]; then
@@ -66,6 +95,8 @@ jobs:
             mkdir -p "dist/$SERVER_NAME"
             go build -trimpath -ldflags "$LDFLAGS" -o "dist/$SERVER_NAME/goose-server${SUFFIX}" ./cmd/server
             cp server_config.example.json "dist/$SERVER_NAME/"
+            mkdir -p "dist/$SERVER_NAME/scripts"
+            cp scripts/goose-relay.service "dist/$SERVER_NAME/scripts/"
           fi
 
           cd dist

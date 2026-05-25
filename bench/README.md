@@ -8,8 +8,8 @@ results are reproducible and reflect code changes, not Google's CDN behaviour.
 ## Quick start
 
 ```sh
-# First time: capture a baseline for the current release.
-./bench/bench.sh --update v1.3.0
+# First time: capture the release baseline you compare against.
+./bench/bench.sh --update v1.6.0
 
 # Day-to-day: build HEAD, run the harness, diff against the latest baseline.
 ./bench/bench.sh
@@ -22,11 +22,13 @@ into your pre-tag flow when you're ready.
 ## Useful flags
 
 ```sh
-./bench/bench.sh --baseline v1.2.0
+./bench/bench.sh --baseline v1.6.0
 ./bench/bench.sh --scenario ttfb_p50_p95
-./bench/bench.sh --scenario throughput_up_64MB_1session,sessions_per_sec
+./bench/bench.sh --scenario ttfb_p50_p95 --transport direct_stream
+./bench/bench.sh --scenario throughput_up_8MB_1session,sessions_per_sec
+./bench/bench.sh --smoke --scenario ttfb_p50_p95 --impairment mobile
 ./bench/bench.sh --verbose                    # stream child stdout/stderr
-./bench/bench.sh --update v1.3.0              # re-record a baseline
+./bench/bench.sh --update v1.6.0              # re-record a baseline
 ```
 
 ## Scenarios
@@ -37,11 +39,29 @@ into your pre-tag flow when you're ready.
 | `throughput_up_8MB_1session` | Single session, 8 MB upload | `mb_per_sec` |
 | `throughput_up_8MB_4sessions` | 4 concurrent sessions, 8 MB each | `mb_per_sec` |
 | `throughput_down_8MB_1session` | Single session, 8 MB download from source sink | `mb_per_sec` |
+| `download_first_byte_8MB` | Single 8 MB download with first-byte timing | `first_byte_us`, `mb_per_sec` |
 | `ttfb_p50_p95` | 50 sequential 1-byte echoes, latency percentiles | `p50_us`, `p95_us`, `p99_us` |
-| `sessions_per_sec` | Open/close churn against quick sink for 10 s | `per_sec` |
+| `ttfb_under_8MB_download` | 1-byte echo latency while repeated 8 MB downloads keep the downlink active | nested TTFB/download metrics |
+| `sessions_per_sec` | Open/close churn against quick sink for 10 s. In `direct_post`, this is mostly a POST active-drain churn metric; use `--transport direct_stream` when you want to isolate session machinery. | `per_sec` |
 | `idle_overhead_15s` | 50 idle echo connections; sample CPU% every 500 ms | `client_cpu_mean`, `server_cpu_mean` |
+| `mixed_stream_bad_syn_bulk` | One bad SYN target while short echoes and a 1 MB download run | `duration_ms`, nested TTFB/download metrics |
 
-Throughput numbers are bounded by `ActiveDrainWindow` (350 ms) — every HTTP round-trip costs at least one window, so a single-session upload caps at roughly `MaxFramePayload × maxDrainFramesPerSession / ActiveDrainWindow` ≈ 6 MB/s. Sizes above are tuned so the full suite finishes in ~90 s.
+Throughput numbers are bounded by `ActiveDrainWindow` (150 ms by default) — every HTTP round-trip costs at least one window, so a single-session upload caps at roughly `MaxFramePayload × maxDrainFramesPerSession / ActiveDrainWindow` ≈ 13 MB/s before transport overhead. Sizes above are tuned so the full suite finishes in ~90 s.
+
+## Transport Comparison
+
+Run latency scenarios once with `--transport direct_post` and once with
+`--transport direct_stream` to compare direct POST TTFB against the persistent
+WebSocket stream path on the same machine.
+
+## Impairment Profiles
+
+`--impairment mobile|lossy|quota` inserts a deterministic HTTP proxy between
+the client and local server. It only works with `--transport direct_post`.
+`mobile` adds repeatable delay/jitter for latency tests. `lossy` adds
+transient 502s. `quota` adds 429 bursts and daily-quota 403 bodies. These are
+synthetic: use them to catch regressions, not to predict exact Google Apps
+Script throughput.
 
 ## Layout
 

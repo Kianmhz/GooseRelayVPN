@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/base64"
+	"encoding/binary"
 	"strings"
 	"testing"
 )
@@ -53,12 +54,84 @@ func TestCryptoOpen_TamperedNonce(t *testing.T) {
 	}
 }
 
+func TestCryptoSealUsesUniqueNonces(t *testing.T) {
+	c := newTestCrypto(t)
+	a, err := c.Seal([]byte("hello"))
+	if err != nil {
+		t.Fatalf("seal a: %v", err)
+	}
+	b, err := c.Seal([]byte("hello"))
+	if err != nil {
+		t.Fatalf("seal b: %v", err)
+	}
+	if bytes.Equal(a[:12], b[:12]) {
+		t.Fatalf("nonce repeated: %x", a[:12])
+	}
+}
+
 func TestCryptoOpen_WrongKey(t *testing.T) {
 	a := newTestCrypto(t)
 	b, _ := NewCryptoFromHexKey(strings.Repeat("ff", 32))
 	env, _ := a.Seal([]byte("hello"))
 	if _, err := b.Open(env); err == nil {
 		t.Fatal("expected auth error on wrong key")
+	}
+}
+
+func TestCryptoSealAllocatesOnlyEnvelope(t *testing.T) {
+	c := newTestCrypto(t)
+	payload := bytes.Repeat([]byte("x"), 1024)
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		if _, err := c.Seal(payload); err != nil {
+			t.Fatalf("seal: %v", err)
+		}
+	})
+	if allocs > 1 {
+		t.Fatalf("Seal allocations = %.2f, want <= 1", allocs)
+	}
+}
+
+func TestCryptoSealToReusesProvidedBuffer(t *testing.T) {
+	c := newTestCrypto(t)
+	payload := bytes.Repeat([]byte("x"), 1024)
+	buf := make([]byte, 0, c.aead.NonceSize()+len(payload)+c.aead.Overhead())
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		out, err := c.sealTo(payload, buf)
+		if err != nil {
+			t.Fatalf("sealTo: %v", err)
+		}
+		if cap(out) != cap(buf) {
+			t.Fatalf("sealTo did not reuse provided buffer")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("sealTo allocations = %.2f, want 0 with sufficient buffer", allocs)
+	}
+}
+
+func TestPutPooledSealedBufferDropsOversizedCapacity(t *testing.T) {
+	buf := make([]byte, 0, maxPooledSealedCap+1)
+	putPooledSealedBuffer(&buf)
+	if cap(buf) > maxPooledSealedCap {
+		t.Fatalf("pooled sealed buffer cap = %d, want <= %d", cap(buf), maxPooledSealedCap)
+	}
+}
+
+func TestPutPooledPlainBufferDropsOversizedCapacity(t *testing.T) {
+	buf := make([]byte, 0, maxPooledPlainCap+1)
+	putPooledPlainBuffer(&buf)
+	if cap(buf) > maxPooledPlainCap {
+		t.Fatalf("pooled plain buffer cap = %d, want <= %d", cap(buf), maxPooledPlainCap)
+	}
+}
+
+func TestPutPooledDecodedSealedBufferDropsOversizedCapacity(t *testing.T) {
+	buf := make([]byte, 0, maxPooledDecodedSealedCap+1)
+	putPooledDecodedSealedBuffer(&buf)
+	if cap(buf) > maxPooledDecodedSealedCap {
+		t.Fatalf("pooled decoded sealed buffer cap = %d, want <= %d", cap(buf), maxPooledDecodedSealedCap)
 	}
 }
 
@@ -103,14 +176,139 @@ func TestEncodeDecodeBatch_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeBatchBinary_RoundTrip(t *testing.T) {
+	c := newTestCrypto(t)
+	in := []*Frame{
+		{SessionID: sid(1), Seq: 0, Flags: FlagSYN, Target: "example.com:80", Payload: []byte("binary")},
+		{SessionID: sid(1), Seq: 1, Payload: []byte("payload")},
+	}
+	wantClient := [ClientIDLen]byte{9, 8, 7, 6}
+
+	body, err := EncodeBatchBinary(c, wantClient, in)
+	if err != nil {
+		t.Fatalf("encode binary: %v", err)
+	}
+	textBody, err := EncodeBatch(c, wantClient, in)
+	if err != nil {
+		t.Fatalf("encode text: %v", err)
+	}
+	if len(body) >= len(textBody) {
+		t.Fatalf("binary body len = %d, want smaller than base64 text len %d", len(body), len(textBody))
+	}
+	gotClient, out, err := DecodeBatchBinary(c, body)
+	if err != nil {
+		t.Fatalf("decode binary: %v", err)
+	}
+	if gotClient != wantClient {
+		t.Fatalf("clientID: got %x want %x", gotClient, wantClient)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("frame count = %d, want %d", len(out), len(in))
+	}
+	for i := range in {
+		if out[i].SessionID != in[i].SessionID || out[i].Seq != in[i].Seq || !bytes.Equal(out[i].Payload, in[i].Payload) {
+			t.Fatalf("frame %d mismatch", i)
+		}
+	}
+}
+
+func TestDecodeBatchBinaryRejectsTrailingPlaintext(t *testing.T) {
+	c := newTestCrypto(t)
+	clientID := [ClientIDLen]byte{1, 2, 3}
+	plain := []byte{batchFlagRaw}
+	plain = append(plain, clientID[:]...)
+	var count [2]byte
+	binary.BigEndian.PutUint16(count[:], 0)
+	plain = append(plain, count[:]...)
+	plain = append(plain, 0x99)
+	sealed, err := c.Seal(plain)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	if _, _, err := DecodeBatchBinary(c, sealed); err == nil {
+		t.Fatal("DecodeBatchBinary accepted authenticated trailing plaintext")
+	}
+}
+
+func TestDecodeBatchBinaryRejectsTrailingBytesInsideFrameBody(t *testing.T) {
+	c := newTestCrypto(t)
+	clientID := [ClientIDLen]byte{1, 2, 3}
+	f := &Frame{SessionID: sid(1), Seq: 0, Payload: []byte("ok")}
+	fb, err := f.Marshal()
+	if err != nil {
+		t.Fatalf("marshal frame: %v", err)
+	}
+	fb = append(fb, 0x99)
+
+	plain := []byte{batchFlagRaw}
+	plain = append(plain, clientID[:]...)
+	var count [2]byte
+	binary.BigEndian.PutUint16(count[:], 1)
+	plain = append(plain, count[:]...)
+	var flen [4]byte
+	binary.BigEndian.PutUint32(flen[:], uint32(len(fb)))
+	plain = append(plain, flen[:]...)
+	plain = append(plain, fb...)
+	sealed, err := c.Seal(plain)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	if _, _, err := DecodeBatchBinary(c, sealed); err == nil {
+		t.Fatal("DecodeBatchBinary accepted trailing bytes inside a framed body")
+	}
+}
+
+func TestShouldAttemptCompressionSkipsHighEntropyPayload(t *testing.T) {
+	payload := make([]byte, 4096)
+	for i := range payload {
+		payload[i] = byte((i*251 + 17) & 0xff)
+	}
+	if shouldAttemptCompression(payload) {
+		t.Fatal("high-entropy payload should skip compression")
+	}
+}
+
+func TestShouldAttemptCompressionAllowsRepetitivePayload(t *testing.T) {
+	payload := bytes.Repeat([]byte("compress-me-"), 512)
+	if !shouldAttemptCompression(payload) {
+		t.Fatal("repetitive payload should attempt compression")
+	}
+}
+
 func TestDecodeBatch_EmptyBody(t *testing.T) {
 	c := newTestCrypto(t)
-	_, out, err := DecodeBatch(c, nil)
-	if err != nil {
-		t.Fatalf("decode empty: %v", err)
+	if _, _, err := DecodeBatch(c, nil); err == nil {
+		t.Fatal("DecodeBatch(nil) succeeded; want empty envelope error")
 	}
-	if len(out) != 0 {
-		t.Fatalf("want 0 frames, got %d", len(out))
+}
+
+func TestDecodeBatch_RejectsNonEmptyEmptyEnvelope(t *testing.T) {
+	c := newTestCrypto(t)
+	for _, body := range [][]byte{
+		[]byte(" \r\n\t "),
+		[]byte("===="),
+	} {
+		if _, _, err := DecodeBatch(c, body); err == nil {
+			t.Fatalf("DecodeBatch(%q) succeeded; want empty envelope error", string(body))
+		}
+	}
+	if _, _, err := DecodeBatchBinary(c, nil); err == nil {
+		t.Fatal("DecodeBatchBinary(nil) succeeded; want empty envelope error")
+	}
+}
+
+func TestReadAllLimitedRejectsExpandedPayload(t *testing.T) {
+	if _, err := readAllLimited(bytes.NewReader([]byte("abcdef")), 5); err == nil {
+		t.Fatal("readAllLimited succeeded for over-limit payload")
+	}
+	got, err := readAllLimited(bytes.NewReader([]byte("abcde")), 5)
+	if err != nil {
+		t.Fatalf("readAllLimited: %v", err)
+	}
+	if string(got) != "abcde" {
+		t.Fatalf("got %q, want abcde", got)
 	}
 }
 
@@ -318,6 +516,46 @@ func TestZstdFlagEmitted(t *testing.T) {
 	if len(body) >= rawEstimate {
 		t.Errorf("zstd body (%d) is not smaller than raw estimate (%d) — compression did not fire or helped nothing",
 			len(body), rawEstimate)
+	}
+}
+
+func TestEncodeBatchWithStatsReportsCompressionOutcome(t *testing.T) {
+	c, err := NewCryptoFromHexKey(testKeyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientID := [ClientIDLen]byte{1, 2, 3}
+
+	compressible := bytes.Repeat([]byte("compressible-payload-"), 128)
+	body, stats, err := EncodeBatchWithStats(c, clientID, []*Frame{{
+		SessionID: [SessionIDLen]byte{1},
+		Payload:   compressible,
+	}})
+	if err != nil {
+		t.Fatalf("EncodeBatchWithStats compressible: %v", err)
+	}
+	if len(body) != stats.WireBytes {
+		t.Fatalf("WireBytes = %d, want body len %d", stats.WireBytes, len(body))
+	}
+	if stats.Mode != "zstd" || !stats.CompressionUsed || !stats.CompressionAttempted {
+		t.Fatalf("compressible stats = %#v, want zstd used", stats)
+	}
+	if stats.SavedBytes == 0 || stats.LostBytes != 0 {
+		t.Fatalf("compressible saved/lost = %d/%d, want saved>0 lost=0", stats.SavedBytes, stats.LostBytes)
+	}
+
+	smallBody, smallStats, err := EncodeBatchWithStats(c, clientID, []*Frame{{
+		SessionID: [SessionIDLen]byte{2},
+		Payload:   []byte("tiny"),
+	}})
+	if err != nil {
+		t.Fatalf("EncodeBatchWithStats small: %v", err)
+	}
+	if len(smallBody) != smallStats.WireBytes {
+		t.Fatalf("small WireBytes = %d, want body len %d", smallStats.WireBytes, len(smallBody))
+	}
+	if smallStats.Mode != "raw" || !smallStats.CompressionSkipped || smallStats.CompressionAttempted {
+		t.Fatalf("small stats = %#v, want raw skipped", smallStats)
 	}
 }
 

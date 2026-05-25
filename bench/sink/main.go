@@ -2,10 +2,10 @@
 // one per port, so scenarios can pick the behaviour that isolates what they
 // measure:
 //
-//   :9101 echo     -> write back what was read (TTFB / round-trip)
-//   :9102 sized    -> read 8-byte length N, drain N bytes, ACK 1 byte (upload throughput)
-//   :9103 sizedSrc -> read 8-byte length N, write N zero bytes, close  (download throughput)
-//   :9104 quick    -> accept, write 1 byte, close                      (connection-setup churn)
+//	:9101 echo     -> write back what was read (TTFB / round-trip)
+//	:9102 sized    -> read 8-byte length N, drain N bytes, ACK 1 byte (upload throughput)
+//	:9103 sizedSrc -> read 8-byte length N, write N zero bytes, close  (download throughput)
+//	:9104 quick    -> accept, write 1 byte, close                      (connection-setup churn)
 //
 // One process owns all four ports so the harness only manages a single child.
 //

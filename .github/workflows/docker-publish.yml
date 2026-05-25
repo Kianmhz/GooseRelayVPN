@@ -17,6 +17,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+          check-latest: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Test
+        run: go test -count=1 -timeout 120s ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          staticcheck ./...
+
+      - name: Govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -30,11 +53,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Lowercase image owner
+        id: image
+        shell: bash
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/gooserelayvpn-server
+          images: ghcr.io/${{ steps.image.outputs.owner }}/gooserelayvpn-server
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

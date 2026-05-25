@@ -3,6 +3,9 @@ client_config.json
 server_config.json
 
 # Built binaries
+*.exe
+*.dll
+*.so
 /client
 /server
 /goose-client
@@ -27,9 +30,16 @@ deploy.sh
 # Misc
 *.token
 *.log
+.goose-client-instance
+.goose-quota-state.json
+goose-diagnostics-*.zip
+goose-server-diagnostics-*.zip
+/diagnostics/
+/logs/
 
 # Bench artifacts (baselines/ are committed; results/ are per-run)
 /bench/bin/
+/bench/.smoke_bin/
 /bench/results/*.json
 /bench/.head_bin/
 /bench/.worktrees/

@@ -1,17 +1,41 @@
 [Unit]
 Description=GooseRelayVPN exit server
 After=network.target
+Wants=network-online.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=/root
-ExecStart=/root/goose-server-linux -config /root/server_config.json
+ExecStart=/root/goose-server -config /root/server_config.json
 Restart=always
 RestartSec=3
 StandardOutput=journal
 StandardError=journal
+LimitNOFILE=1048576
+OOMScoreAdjust=-500
+Nice=-10
+Environment="GOGC=200"
+Environment="GOMEMLIMIT=400MiB"
+
+# Writable service-owned state path. Use
+# /var/lib/goose-relay/diagnostics for startup diagnostics when
+# ProtectHome=read-only is enabled.
+StateDirectory=goose-relay
+
+# Modest hardening. The server still reads /root/server_config.json and opens
+# outbound TCP connections, but it should not need writable system paths or
+# privilege escalation.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target

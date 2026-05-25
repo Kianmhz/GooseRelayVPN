@@ -7,3 +7,4 @@ services:
       - "8443:8443"
     volumes:
       - ./server_config.json:/app/server_config.json:ro
+      - ./diagnostics:/app/diagnostics
