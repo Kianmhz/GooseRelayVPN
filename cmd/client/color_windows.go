@@ -29,9 +29,5 @@ func platformColorSupported(out *os.File) bool {
 	}
 
 	r1, _, _ = procSetConsoleMode.Call(uintptr(h), uintptr(mode|enableVirtualTerminalProcessing))
-	if r1 == 0 {
-		return false
-	}
-
-	return true
+	return r1 != 0
 }

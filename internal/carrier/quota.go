@@ -10,10 +10,12 @@ import (
 	"time"
 )
 
-// quotaResetTZ is the Apps Script quota reset timezone. Google resets the
-// per-account UrlFetch quota at midnight Pacific. Loaded once at init; falls
-// back to a fixed -08:00 zone if the system tzdata is unavailable so the
-// reset boundary is still computable in stripped-down container images.
+// quotaResetTZ is used only for local daily stats windows. Google documents
+// Apps Script quotas as per-user windows that reset 24 hours after first use;
+// this Pacific day boundary is an approximation that keeps counters readable.
+// Loaded once at init; falls back to a fixed -08:00 zone if the system tzdata
+// is unavailable so the local boundary remains computable in stripped-down
+// container images.
 var quotaResetTZ = func() *time.Location {
 	if loc, err := time.LoadLocation("America/Los_Angeles"); err == nil {
 		return loc
@@ -21,14 +23,15 @@ var quotaResetTZ = func() *time.Location {
 	return time.FixedZone("PST", -8*3600)
 }()
 
-// nextQuotaReset returns the next midnight in the Apps Script quota timezone
-// strictly after now. The returned instant is when the dailyCount counter
-// should be zeroed for endpoints whose last reset was before this point.
+// nextQuotaReset returns the next midnight in the local quota accounting
+// timezone strictly after now. The returned instant is when the dailyCount
+// counter should be zeroed for endpoints whose last reset was before this
+// point; it is not an exact Google quota reset guarantee.
 func nextQuotaReset(now time.Time) time.Time {
 	local := now.In(quotaResetTZ)
 	midnight := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, quotaResetTZ)
 	if !midnight.After(now) {
-		midnight = midnight.Add(24 * time.Hour)
+		midnight = time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, quotaResetTZ)
 	}
 	return midnight
 }
@@ -46,18 +49,48 @@ func (c *Client) touchDailyWindow(ep *relayEndpoint, now time.Time) (rolledOver 
 	if now.Before(ep.dailyResetAt) {
 		return false
 	}
+	expiredReset := ep.dailyResetAt
 	ep.dailyCount = 0
 	ep.dailyResetAt = nextQuotaReset(now)
+	ep.quotaExhaustedUntil = time.Time{}
+	if !ep.blacklistedTill.IsZero() && !ep.blacklistedTill.After(expiredReset) {
+		ep.blacklistedTill = time.Time{}
+	}
 	return true
 }
 
-// bumpDailyCount records one Apps Script invocation for an endpoint.
+// bumpDailyCount records one local Apps Script request estimate for an endpoint.
 //
-// Counts are bumped per HTTP response received (regardless of status), since
-// every Apps Script doPost invocation consumes one quota unit even when it
-// returns 403 or an HTML error page. Transport-level failures (no response
-// reached Apps Script) do not count.
+// Counts are bumped per HTTP response received (regardless of status). Normal
+// tunnel polls usually spend at least one UrlFetch call, but exact Google quota
+// burn can differ when Code.gs retries multiple RELAY_URLS or rejects invalid
+// public probes before fetch. Transport-level failures (no response reached
+// Apps Script) do not count.
 func (c *Client) bumpDailyCount(endpointIdx int) {
+	c.bumpDailyCountForURL(endpointIdx, "")
+}
+
+func (c *Client) bumpDailyCountForLease(lease endpointLease) {
+	if !c.useFronting {
+		return
+	}
+	if !lease.valid() {
+		return
+	}
+	c.endpointMu.Lock()
+	defer c.endpointMu.Unlock()
+	if !c.endpointLeaseMatchesLocked(lease) {
+		return
+	}
+	ep := &c.endpoints[lease.idx]
+	c.touchDailyWindow(ep, time.Now())
+	ep.dailyCount++
+}
+
+func (c *Client) bumpDailyCountForURL(endpointIdx int, expectedURL string) {
+	if !c.useFronting {
+		return
+	}
 	if endpointIdx < 0 {
 		return
 	}
@@ -67,6 +100,9 @@ func (c *Client) bumpDailyCount(endpointIdx int) {
 		return
 	}
 	ep := &c.endpoints[endpointIdx]
+	if expectedURL != "" && ep.url != expectedURL {
+		return
+	}
 	c.touchDailyWindow(ep, time.Now())
 	ep.dailyCount++
 }
@@ -96,14 +132,15 @@ const (
 // scriptStatsResponse is the JSON the deployed Code.gs returns from doGet.
 // Mirrors the shape produced in apps_script/Code.gs.
 type scriptStatsResponse struct {
-	OK       bool   `json:"ok"`
-	Date     string `json:"date"`
-	Count    int64  `json:"count"`
-	Version  int    `json:"version"`
-	Protocol int    `json:"protocol"`
+	OK              bool   `json:"ok"`
+	Date            string `json:"date"`
+	Count           int64  `json:"count"`
+	CountingEnabled *bool  `json:"counting_enabled"`
+	Version         int    `json:"version"`
+	Protocol        int    `json:"protocol"`
 }
 
-// runScriptStatsLoop polls each deployment's doGet endpoint hourly and records
+// runScriptStatsLoop polls each deployment's doGet endpoint periodically and records
 // the script-reported daily count on the corresponding relayEndpoint. The
 // recorded value is surfaced in the periodic [stats] line as `script=N`. Runs
 // until ctx is canceled.
@@ -159,10 +196,10 @@ func (c *Client) fetchScriptStats(ctx context.Context, idx int, url string) {
 	defer resp.Body.Close()
 
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, scriptStatsMaxBody))
-	// doGet, like doPost, consumes one Apps Script invocation regardless of
-	// what we do with the response, so bump the daily counter on any HTTP
-	// response we got back.
-	c.bumpDailyCount(idx)
+	// Count the stats probe as local request pressure on any HTTP response.
+	// Google documents UrlFetch quota, not a simple one-unit web-app invocation
+	// counter, so this remains an estimate.
+	c.bumpDailyCountForURL(idx, url)
 	if readErr != nil {
 		return
 	}
@@ -186,8 +223,18 @@ func (c *Client) recordScriptStatsFromBody(idx int, url string, body []byte) {
 		c.logScriptStatsParseErrorOnce(idx, url, trimmed)
 		return
 	}
+	if stats.CountingEnabled == nil || !*stats.CountingEnabled {
+		c.endpointMu.Lock()
+		if idx >= 0 && idx < len(c.endpoints) && c.endpoints[idx].url == url {
+			c.endpoints[idx].scriptCount = 0
+			c.endpoints[idx].scriptCountAt = time.Time{}
+			c.endpoints[idx].scriptStatsErrLogged = false
+		}
+		c.endpointMu.Unlock()
+		return
+	}
 	c.endpointMu.Lock()
-	if idx >= 0 && idx < len(c.endpoints) {
+	if idx >= 0 && idx < len(c.endpoints) && c.endpoints[idx].url == url {
 		c.endpoints[idx].scriptCount = uint64(stats.Count)
 		c.endpoints[idx].scriptCountAt = time.Now()
 		// On a successful parse, clear the once-flag so a future regression
@@ -203,6 +250,10 @@ func (c *Client) logScriptStatsParseErrorOnce(idx int, url string, body []byte) 
 		c.endpointMu.Unlock()
 		return
 	}
+	if c.endpoints[idx].url != url {
+		c.endpointMu.Unlock()
+		return
+	}
 	if c.endpoints[idx].scriptStatsErrLogged {
 		c.endpointMu.Unlock()
 		return
@@ -214,6 +265,6 @@ func (c *Client) logScriptStatsParseErrorOnce(idx int, url string, body []byte) 
 	if len(snippet) > 80 {
 		snippet = snippet[:80] + "..."
 	}
-	log.Printf("[carrier] script stats unavailable for %s — redeploy apps_script/Code.gs to enable per-deployment count reporting (got: %q)",
+	log.Printf("[carrier] script stats unavailable for %s - redeploy apps_script/Code.gs to enable per-deployment count reporting (got: %q)",
 		shortScriptKey(url), snippet)
 }

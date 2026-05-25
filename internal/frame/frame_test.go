@@ -92,6 +92,13 @@ func TestFrameRoundTrip_FIN_NoPayload(t *testing.T) {
 	}
 }
 
+func TestFrameRejectsPayloadAboveProtocolFrameLimit(t *testing.T) {
+	f := &Frame{Payload: make([]byte, 256*1024+1)}
+	if _, err := f.Marshal(); err == nil {
+		t.Fatal("Marshal accepted a payload above the protocol frame limit")
+	}
+}
+
 func TestFrameRoundTrip_ACK(t *testing.T) {
 	in := &Frame{SessionID: sid(0x77), Seq: 7, Flags: FlagACK}
 	raw, err := in.Marshal()

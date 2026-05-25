@@ -12,14 +12,14 @@ import (
 const (
 	FlagSYN = 1 << 0 // first frame for a session, carries Target
 	FlagFIN = 1 << 1 // sender is closing its write side
-	FlagACK = 1 << 2 // ACK-only / keepalive (no payload, no SYN, no FIN)
+	FlagACK = 1 << 2 // control/ack frame; payload format depends on protocol feature
 	FlagRST = 1 << 3 // session reset: sender has no state for this session (e.g. server restart)
 )
 
 const (
 	SessionIDLen   = 16
 	maxTargetLen   = 255
-	maxPayloadSize = 10 * 1024 * 1024 // 10MB sanity cap
+	maxPayloadSize = 256 * 1024
 )
 
 // Frame is the plaintext message exchanged between client and VPS server,

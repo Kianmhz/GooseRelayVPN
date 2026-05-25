@@ -23,6 +23,7 @@ func BenchmarkSessionEnqueueDrain_128KiB(b *testing.B) {
 		s.OnTx = func() {}
 		s.EnqueueTx(chunk)
 		_ = s.DrainTx(128 * 1024)
+		s.Stop()
 	}
 }
 
@@ -34,6 +35,7 @@ func BenchmarkSessionEnqueueDrain_1MiB(b *testing.B) {
 		s.OnTx = func() {}
 		s.EnqueueTx(chunk)
 		_ = s.DrainTx(128 * 1024)
+		s.Stop()
 	}
 }
 
@@ -55,6 +57,7 @@ func BenchmarkSessionDrainTxLimited_VariedBudget(b *testing.B) {
 				s.OnTx = func() {}
 				s.EnqueueTx(chunk)
 				_ = s.DrainTxLimited(64*1024, tc.maxFrames)
+				s.Stop()
 			}
 		})
 	}
@@ -71,5 +74,6 @@ func BenchmarkSessionProcessRx_Ordered(b *testing.B) {
 		}
 		s.ProcessRx(&frame.Frame{SessionID: s.ID, Seq: 32, Flags: frame.FlagFIN})
 		<-s.RxChan
+		s.Stop()
 	}
 }

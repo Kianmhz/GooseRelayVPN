@@ -1,58 +1,128 @@
 {
   "ref": "v1.6.0",
   "commit": "91b2fba",
-  "go_version": "go1.26.2",
+  "go_version": "go1.26.3",
   "host": {
-    "os": "darwin",
-    "arch": "arm64",
+    "os": "windows",
+    "arch": "amd64",
     "ncpu": 8
   },
-  "started_at": "2026-05-21T18:41:43Z",
-  "duration_ms": 46691,
+  "started_at": "2026-05-23T23:28:42Z",
+  "duration_ms": 72145,
   "scenarios": {
+    "browsing_latency_while_download_active": {
+      "download_bytes": 8388608,
+      "downloads_completed": 16,
+      "last_download": {
+        "bytes": 8388608,
+        "duration_ms": 413,
+        "mb_per_sec": 19.33
+      },
+      "ttfb": {
+        "mean_us": 207435,
+        "n": 30,
+        "p50_us": 265515,
+        "p95_us": 362181,
+        "p99_us": 362318
+      }
+    },
+    "download_first_byte_16MB": {
+      "bytes": 16777216,
+      "duration_ms": 456,
+      "first_byte_us": 358693,
+      "mb_per_sec": 35.02
+    },
+    "download_first_byte_8MB": {
+      "bytes": 8388608,
+      "duration_ms": 440,
+      "first_byte_us": 356235,
+      "mb_per_sec": 18.17
+    },
+    "download_pause_at_97pct_8MB": {
+      "after_pause_ms": 0,
+      "before_pause_ms": 415,
+      "bytes": 8388608,
+      "duration_ms": 1415,
+      "effective_mb_sec": 5.65,
+      "first_byte_us": 363641,
+      "pause_ms": 1000,
+      "pause_percent": 97,
+      "post_pause_mb_sec": 0
+    },
     "idle_overhead_15s": {
-      "client_cpu_max": 1.3,
-      "client_cpu_mean": 0.05,
+      "client_cpu_max": 0,
+      "client_cpu_mean": 0,
       "duration_ms": 15000,
       "samples": 30,
-      "server_cpu_max": 2.9,
-      "server_cpu_mean": 0.11,
+      "server_cpu_max": 0,
+      "server_cpu_mean": 0,
       "sessions": 50
     },
+    "mixed_stream_bad_syn_bulk": {
+      "download": {
+        "bytes": 1048576,
+        "duration_ms": 465,
+        "mb_per_sec": 2.15
+      },
+      "duration_ms": 8406,
+      "ttfb": {
+        "mean_us": 395448,
+        "n": 20,
+        "p50_us": 367812,
+        "p95_us": 541110,
+        "p99_us": 541110
+      }
+    },
     "sessions_per_sec": {
-      "duration_ms": 10016,
+      "duration_ms": 10141,
       "fail": 0,
-      "ok": 1082,
-      "per_sec": 108.03
+      "ok": 452,
+      "per_sec": 44.57
     },
     "throughput_down_8MB_1session": {
       "bytes": 8388608,
-      "duration_ms": 401,
-      "mb_per_sec": 19.93
+      "duration_ms": 423,
+      "mb_per_sec": 18.88
     },
     "throughput_up_1MB_1session": {
       "bytes": 1048576,
-      "duration_ms": 355,
-      "mb_per_sec": 2.81
+      "duration_ms": 370,
+      "mb_per_sec": 2.7
     },
     "throughput_up_8MB_1session": {
       "bytes": 8388608,
-      "duration_ms": 1780,
-      "mb_per_sec": 4.49
+      "duration_ms": 1788,
+      "mb_per_sec": 4.47
     },
     "throughput_up_8MB_4sessions": {
       "bytes_per_session": 8388608,
-      "duration_ms": 1456,
-      "mb_per_sec": 21.97,
+      "duration_ms": 1103,
+      "mb_per_sec": 29,
       "sessions": 4,
       "total_bytes": 33554432
     },
     "ttfb_p50_p95": {
-      "mean_us": 351968,
+      "mean_us": 355663,
       "n": 50,
-      "p50_us": 352001,
-      "p95_us": 352252,
-      "p99_us": 352329
+      "p50_us": 354931,
+      "p95_us": 359741,
+      "p99_us": 361147
+    },
+    "ttfb_under_8MB_download": {
+      "download_bytes": 8388608,
+      "downloads_completed": 16,
+      "last_download": {
+        "bytes": 8388608,
+        "duration_ms": 400,
+        "mb_per_sec": 19.96
+      },
+      "ttfb": {
+        "mean_us": 207707,
+        "n": 30,
+        "p50_us": 252417,
+        "p95_us": 360135,
+        "p99_us": 362729
+      }
     }
   }
 }

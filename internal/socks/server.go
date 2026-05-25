@@ -6,6 +6,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
+	"sync/atomic"
 
 	"github.com/kianmhz/GooseRelayVPN/internal/session"
 	"github.com/things-go/go-socks5"
@@ -30,17 +32,25 @@ type SessionFactory func(target string) *session.Session
 // When user and pass are both non-empty, RFC 1929 username/password
 // authentication is required; unauthenticated clients are rejected.
 //
-// Blocks until ListenAndServe returns. Caller passes ctx for shutdown
-// signaling (the underlying go-socks5 library doesn't take a ctx, so this
-// just wires it through for parity with the rest of the codebase).
-func Serve(_ context.Context, listenAddr, user, pass string, debugTiming bool, factory SessionFactory) error {
+// Blocks until the SOCKS server returns or ctx is canceled. The underlying
+// go-socks5 server does not accept a context, so cancellation closes the
+// listener to unblock Serve.
+func Serve(ctx context.Context, listenAddr, user, pass string, debugTiming bool, maxSessions int, factory SessionFactory) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	limiter := newSessionLimiter(maxSessions)
 	opts := []socks5.Option{
 		socks5.WithDial(func(_ context.Context, _, addr string) (net.Conn, error) {
+			release, ok := limiter.acquire()
+			if !ok {
+				return nil, fmt.Errorf("max local SOCKS sessions reached (%d)", maxSessions)
+			}
 			s := factory(addr)
 			if debugTiming {
 				log.Printf("[socks] new session %x for %s", s.ID[:4], addr)
 			}
-			return NewVirtualConn(s), nil
+			return &limitedConn{Conn: NewVirtualConn(s), release: release}, nil
 		}),
 		socks5.WithAssociateHandle(func(_ context.Context, w io.Writer, _ *socks5.Request) error {
 			_ = socks5.SendReply(w, statute.RepCommandNotSupported, nil)
@@ -60,24 +70,69 @@ func Serve(_ context.Context, listenAddr, user, pass string, debugTiming bool, f
 	if err != nil {
 		return err
 	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = ln.Close()
+		case <-done:
+		}
+	}()
 	server := socks5.NewServer(opts...)
-	return server.Serve(&noDelayListener{Listener: ln})
+	err = server.Serve(&noDelayListener{Listener: ln})
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
-// listenNetwork picks the right network family for net.Listen based on the
-// literal address. Defaulting to "tcp" causes Go to bind an AF_INET6 socket
-// with V4MAPPED even for explicit IPv4 addresses like "0.0.0.0"; on Linux
-// hosts where net.ipv6.bindv6only=1, that socket then refuses IPv4
-// connections (issues #94 and #111). Forcing "tcp4" / "tcp6" when the host
-// is an IP literal sidesteps that, while leaving hostnames on "tcp" so
-// resolver-driven setups (e.g. "localhost") still work.
-func listenNetwork(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
+type sessionLimiter struct {
+	max    int
+	active atomic.Int32
+}
+
+func newSessionLimiter(max int) *sessionLimiter {
+	return &sessionLimiter{max: max}
+}
+
+func (l *sessionLimiter) acquire() (func(), bool) {
+	if l == nil || l.max <= 0 {
+		return func() {}, true
+	}
+	current := l.active.Add(1)
+	if current > int32(l.max) {
+		l.active.Add(-1)
+		return nil, false
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.active.Add(-1)
+		})
+	}, true
+}
+
+type limitedConn struct {
+	net.Conn
+	release func()
+	once    sync.Once
+}
+
+func (c *limitedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		if c.release != nil {
+			c.release()
+		}
+	})
+	return err
+}
+
+func listenNetwork(listenAddr string) string {
+	host, _, err := net.SplitHostPort(listenAddr)
 	if err != nil {
 		return "tcp"
-	}
-	if host == "" {
-		return "tcp" // bare ":1080" — let Go pick
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {

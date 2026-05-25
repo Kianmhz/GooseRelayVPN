@@ -8,6 +8,7 @@ import (
 var (
 	benchFrameBytes  []byte
 	benchFrameResult *Frame
+	benchFrames      []*Frame
 )
 
 func BenchmarkFrameAppendMarshal_4KiB(b *testing.B) {
@@ -53,5 +54,46 @@ func BenchmarkFrameUnmarshal_4KiB(b *testing.B) {
 			b.Fatalf("unmarshal: %v", err)
 		}
 		benchFrameResult = out
+	}
+}
+
+func BenchmarkEncodeBatchBinary_64Frames(b *testing.B) {
+	c, err := NewCryptoFromHexKey(testKeyHex)
+	if err != nil {
+		b.Fatalf("crypto: %v", err)
+	}
+	in := benchMarshalBatch(b, 64)
+	var benchClient [ClientIDLen]byte
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := EncodeBatchBinary(c, benchClient, in)
+		if err != nil {
+			b.Fatalf("encode binary: %v", err)
+		}
+		benchFrameBytes = out
+	}
+}
+
+func BenchmarkDecodeBatchBinary_64Frames(b *testing.B) {
+	c, err := NewCryptoFromHexKey(testKeyHex)
+	if err != nil {
+		b.Fatalf("crypto: %v", err)
+	}
+	in := benchMarshalBatch(b, 64)
+	var benchClient [ClientIDLen]byte
+	body, err := EncodeBatchBinary(c, benchClient, in)
+	if err != nil {
+		b.Fatalf("encode binary: %v", err)
+	}
+	b.SetBytes(int64(len(body)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, out, err := DecodeBatchBinary(c, body)
+		if err != nil {
+			b.Fatalf("decode binary: %v", err)
+		}
+		benchFrames = out
 	}
 }

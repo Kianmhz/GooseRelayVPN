@@ -8,7 +8,10 @@
 package session
 
 import (
+	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kianmhz/GooseRelayVPN/internal/frame"
@@ -17,6 +20,127 @@ import (
 // TxBufHighWater is the soft ceiling on the per-session tx buffer; EnqueueTx
 // blocks once exceeded so a fast SOCKS5 writer can't cause unbounded growth.
 const TxBufHighWater = 8 * 1024 * 1024
+
+const txBufInitialCap = 64 * 1024
+
+var ErrClosed = errors.New("session: closed")
+
+// TxBudget bounds queued client-side TX bytes across many sessions. A single
+// write larger than the budget is allowed when the budget is otherwise empty,
+// which prevents misconfigured small budgets from deadlocking one large write.
+type TxBudget struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	limit int
+	used  int
+}
+
+// NewTxBudget creates a shared TX byte budget. limit <= 0 disables the budget.
+func NewTxBudget(limit int) *TxBudget {
+	if limit <= 0 {
+		return nil
+	}
+	b := &TxBudget{limit: limit}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+// Reserve waits until n bytes can be queued. shouldStop may abort the wait,
+// for example when a session closes while a writer is blocked on the budget.
+func (b *TxBudget) Reserve(n int, shouldStop func() bool) bool {
+	return b.ReserveUntil(n, time.Time{}, shouldStop)
+}
+
+// ReserveUntil is Reserve with an optional deadline. It wakes blocked waiters
+// when the deadline expires so callers implementing net.Conn deadlines do not
+// wait forever when no drain occurs.
+func (b *TxBudget) ReserveUntil(n int, deadline time.Time, shouldStop func() bool) bool {
+	return b.ReserveUntilFunc(n, func() time.Time { return deadline }, shouldStop)
+}
+
+// ReserveUntilFunc is ReserveUntil with a deadline function that is re-read
+// while blocked. It lets net.Conn SetWriteDeadline affect an in-progress write.
+func (b *TxBudget) ReserveUntilFunc(n int, deadlineFn func() time.Time, shouldStop func() bool) bool {
+	if b == nil || n <= 0 {
+		return true
+	}
+	timer := newCondDeadlineTimer(b.cond)
+	defer timer.stop()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for b.used > 0 && b.used+n > b.limit {
+		if shouldStop != nil && shouldStop() {
+			return false
+		}
+		deadline := currentDeadline(deadlineFn)
+		if deadlineExpired(deadline) || !timer.refresh(deadline) {
+			return false
+		}
+		b.cond.Wait()
+	}
+	if shouldStop != nil && shouldStop() {
+		return false
+	}
+	if deadlineExpired(currentDeadline(deadlineFn)) {
+		return false
+	}
+	b.used += n
+	return true
+}
+
+// Release returns n queued bytes to the shared budget and wakes blocked writers.
+func (b *TxBudget) Release(n int) {
+	if b == nil || n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.used -= n
+	if b.used < 0 {
+		b.used = 0
+	}
+	b.cond.Broadcast()
+	b.mu.Unlock()
+}
+
+// Reclaim marks n bytes as queued again after a drained batch is rolled back.
+// It intentionally does not block when this temporarily exceeds the limit:
+// concurrent writers may have used the released capacity while the batch was
+// in flight, and preserving already-accepted TCP bytes is more important than
+// strict accounting at the instant of recovery. Later drains release the debt.
+func (b *TxBudget) Reclaim(n int) {
+	if b == nil || n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.used += n
+	b.mu.Unlock()
+}
+
+// Wake wakes budget waiters so they can observe their session close state.
+func (b *TxBudget) Wake() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.cond.Broadcast()
+	b.mu.Unlock()
+}
+
+func (b *TxBudget) Used() int {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.used
+}
+
+func (b *TxBudget) Limit() int {
+	if b == nil {
+		return 0
+	}
+	return b.limit
+}
 
 // sessionFinalTimeout is the maximum time to wait for the peer's FIN after
 // we have sent ours. If the peer's FIN frame is lost (e.g. dropped poll
@@ -28,9 +152,9 @@ const sessionFinalTimeout = 30 * time.Second
 // rxInboxCap bounds how many in-flight frames can be queued from poll workers
 // to the per-session rxLoop. Sized so a multi-user client absorbing a full
 // busy-mode batch (144 frames) for one session across two simultaneous
-// responses cannot overflow during a brief consumer pause. With 256KB max
-// payload this is at most rxInboxCap × 256KB worth of pointers (the payloads
-// themselves are zero-copy slices into the response body, GC'd as drained).
+// responses cannot overflow during a brief consumer pause. Received payloads
+// are cloned before enqueue so replay/duplicate handling cannot be corrupted
+// by response-buffer reuse; tune this alongside receive byte budgets.
 const rxInboxCap = 1024
 
 // rxInboxBlockTimeout is how long ProcessRx waits for rxInbox to drain when
@@ -39,20 +163,29 @@ const rxInboxCap = 1024
 // last longer, and those should drop the session.
 const rxInboxBlockTimeout = 5 * time.Second
 
+// rxReorderCap bounds future frames held while waiting for a missing sequence.
+// If a relay response is lost, later frames cannot be delivered anyway; closing
+// the session is better than letting an unbounded map grow until idle GC.
+const rxReorderCap = 512
+
 // Session is one logical TCP connection across the relay.
 type Session struct {
 	ID     [frame.SessionIDLen]byte
 	Target string // "host:port", carried on the SYN frame
 
-	mu      sync.Mutex
-	txCond  *sync.Cond
-	txBuf   []byte
-	txSeq   uint64
-	rxSeq   uint64
-	rxQueue map[uint64]*frame.Frame
+	mu       sync.Mutex
+	txCond   *sync.Cond
+	txBuf    []byte
+	txBudget *TxBudget
+	txSeq    uint64
+	rxSeq    uint64
+	rxAckSeq uint64
+	rxQueue  map[uint64]*frame.Frame
 
 	synNeeded     bool // first outgoing frame must carry SYN+Target
 	closeReq      bool // VirtualConn.Close() called; FIN must be sent on next drain
+	txClosed      atomic.Bool
+	aborted       bool
 	finSent       bool
 	finSentAt     time.Time // when finSent was set; used for orphan reaping
 	firstQueuedAt time.Time // timestamp of the oldest frame waiting to be sent
@@ -64,12 +197,30 @@ type Session struct {
 	// true. The carrier sets it to wake its long-poll loop.
 	OnTx func()
 
+	// OnAbort is invoked when the session self-terminates due to defensive
+	// receive-side limits such as reorder overflow or a blocked RX inbox.
+	OnAbort func(reason string)
+
+	// OnRxAdvance is invoked when downstream frames have been accepted in
+	// sequence and queued to RxChan. nextSeq is the next expected downstream
+	// sequence number, so all frames with Seq < nextSeq are safe to ACK at the
+	// tunnel layer even if the local SOCKS consumer has not read them yet.
+	OnRxAdvance func(nextSeq uint64)
+
 	// rxInbox is the per-session inbox for incoming frames. rxLoop drains it
 	// so poll workers are never blocked by a slow SOCKS consumer on one session
 	// holding up frame delivery for all other sessions.
 	rxInbox  chan *frame.Frame
 	rxDone   chan struct{}
 	stopOnce sync.Once
+}
+
+// SetTxBudget attaches a shared queued-TX memory budget. Call before publishing
+// the session to writers.
+func (s *Session) SetTxBudget(b *TxBudget) {
+	s.mu.Lock()
+	s.txBudget = b
+	s.mu.Unlock()
 }
 
 // New creates a session with a random ID is the caller's responsibility — pass
@@ -98,6 +249,36 @@ func New(id [frame.SessionIDLen]byte, target string, needsSYN bool) *Session {
 // session from the routing table so no new ProcessRx calls can arrive.
 func (s *Session) Stop() {
 	s.stopOnce.Do(func() { close(s.rxDone) })
+}
+
+// Abort tears the session down locally without emitting a FIN/RST frame. It is
+// used when the carrier cannot reach any relay endpoint: the local SOCKS side
+// needs EOF immediately so the calling VPN app reconnects instead of writing
+// into a black hole.
+func (s *Session) Abort() {
+	s.mu.Lock()
+	s.txClosed.Store(true)
+	s.aborted = true
+	releaseBytes := len(s.txBuf)
+	budget := s.txBudget
+	s.closeReq = true
+	s.txBuf = nil
+	s.synNeeded = false
+	s.finSent = true
+	s.firstQueuedAt = time.Time{}
+	s.OnTx = nil
+	s.txCond.Broadcast()
+	s.mu.Unlock()
+	budget.Release(releaseBytes)
+	budget.Wake()
+	s.Stop()
+}
+
+func (s *Session) abortReceive(reason string) {
+	if s.OnAbort != nil {
+		s.OnAbort(reason)
+	}
+	s.Abort()
 }
 
 // rxLoop is a per-session goroutine that delivers frames from rxInbox to RxChan
@@ -129,14 +310,69 @@ func (s *Session) rxLoop() {
 
 // EnqueueTx appends bytes to the session's tx buffer. Blocks while the buffer
 // exceeds TxBufHighWater. Safe to call concurrently with DrainTx.
-func (s *Session) EnqueueTx(data []byte) {
+func (s *Session) EnqueueTx(data []byte) error {
+	return s.EnqueueTxDeadline(data, time.Time{})
+}
+
+// EnqueueTxDeadline appends bytes to the tx buffer, respecting deadline when
+// backpressure or the global TX budget blocks the write.
+func (s *Session) EnqueueTxDeadline(data []byte, deadline time.Time) error {
+	return s.EnqueueTxDeadlineFunc(data, func() time.Time { return deadline })
+}
+
+// EnqueueTxDeadlineFunc is EnqueueTxDeadline with a deadline function that is
+// re-read while blocked. This supports net.Conn SetWriteDeadline semantics for
+// writes that are already waiting on backpressure.
+func (s *Session) EnqueueTxDeadlineFunc(data []byte, deadlineFn func() time.Time) error {
 	s.mu.Lock()
+	timer := newCondDeadlineTimer(s.txCond)
+	defer timer.stop()
 	for len(s.txBuf) > TxBufHighWater && !s.closeReq {
+		deadline := currentDeadline(deadlineFn)
+		if deadlineExpired(deadline) || !timer.refresh(deadline) {
+			s.mu.Unlock()
+			return context.DeadlineExceeded
+		}
 		s.txCond.Wait()
 	}
 	if s.closeReq {
 		s.mu.Unlock()
-		return
+		return ErrClosed
+	}
+	budget := s.txBudget
+	s.mu.Unlock()
+
+	if !budget.ReserveUntilFunc(len(data), deadlineFn, func() bool { return s.txClosed.Load() }) {
+		if s.txClosed.Load() {
+			return ErrClosed
+		}
+		if deadlineExpired(currentDeadline(deadlineFn)) {
+			return context.DeadlineExceeded
+		}
+		return ErrClosed
+	}
+
+	s.mu.Lock()
+	for len(s.txBuf) > TxBufHighWater && !s.closeReq {
+		deadline := currentDeadline(deadlineFn)
+		if deadlineExpired(deadline) || !timer.refresh(deadline) {
+			s.mu.Unlock()
+			budget.Release(len(data))
+			return context.DeadlineExceeded
+		}
+		s.txCond.Wait()
+	}
+	if s.closeReq {
+		s.mu.Unlock()
+		budget.Release(len(data))
+		return ErrClosed
+	}
+	if s.txBuf == nil {
+		capHint := txBufInitialCap
+		if len(data) > capHint {
+			capHint = len(data)
+		}
+		s.txBuf = make([]byte, 0, capHint)
 	}
 	s.txBuf = append(s.txBuf, data...)
 	if s.firstQueuedAt.IsZero() {
@@ -147,31 +383,84 @@ func (s *Session) EnqueueTx(data []byte) {
 	if cb != nil {
 		cb()
 	}
+	return nil
 }
 
 // EnqueueInitialData appends data to the tx buffer while synNeeded is still
-// true, so the first DrainTx call bundles it into the SYN frame's payload
-// (the connect_data optimization — saves one round-trip on every TLS
-// handshake and HTTP request).
-//
-// Previously this prepended, on the assumption it'd be called once before
-// any other write. But the SOCKS5 adapter calls it on every Write, and the
-// local write loop is frequently faster than poll workers — multiple calls
-// land before the SYN drains, and prepending REVERSES byte order. For a
-// payload whose first bytes carry framing/length (a TLS record header, an
-// HTTP request line, the bench harness's 8-byte size prefix), reordering
-// silently corrupts the upstream stream. The bug also rendered every
-// upload-throughput benchmark we have meaningless: with a size-prefixed
-// payload of zeros, the upstream parsed a body chunk's leading zeros as
-// "expect 0 bytes" and ACKed immediately, making upload look ~5× faster
-// than it actually was.
-func (s *Session) EnqueueInitialData(data []byte) {
+// true, so the first DrainTx call bundles it into the SYN frame payload. The
+// SOCKS adapter can call this multiple times before the carrier drains the SYN;
+// appending preserves stream byte order across those calls.
+func (s *Session) EnqueueInitialData(data []byte) error {
+	return s.EnqueueInitialDataDeadline(data, time.Time{})
+}
+
+// EnqueueInitialDataDeadline is EnqueueInitialData with an optional write
+// deadline for net.Conn compatibility.
+func (s *Session) EnqueueInitialDataDeadline(data []byte, deadline time.Time) error {
+	return s.EnqueueInitialDataDeadlineFunc(data, func() time.Time { return deadline })
+}
+
+// EnqueueInitialDataDeadlineFunc is EnqueueInitialDataDeadline with a deadline
+// function that can change while the caller is blocked.
+func (s *Session) EnqueueInitialDataDeadlineFunc(data []byte, deadlineFn func() time.Time) error {
 	s.mu.Lock()
 	if !s.synNeeded {
 		// Too late, SYN already sent. Just regular enqueue.
 		s.mu.Unlock()
-		s.EnqueueTx(data)
-		return
+		return s.EnqueueTxDeadlineFunc(data, deadlineFn)
+	}
+	timer := newCondDeadlineTimer(s.txCond)
+	defer timer.stop()
+	if s.closeReq {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	for len(s.txBuf) > TxBufHighWater && !s.closeReq {
+		deadline := currentDeadline(deadlineFn)
+		if deadlineExpired(deadline) || !timer.refresh(deadline) {
+			s.mu.Unlock()
+			return context.DeadlineExceeded
+		}
+		s.txCond.Wait()
+	}
+	if s.closeReq {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	budget := s.txBudget
+	s.mu.Unlock()
+
+	if !budget.ReserveUntilFunc(len(data), deadlineFn, func() bool { return s.txClosed.Load() }) {
+		if s.txClosed.Load() {
+			return ErrClosed
+		}
+		if deadlineExpired(currentDeadline(deadlineFn)) {
+			return context.DeadlineExceeded
+		}
+		return ErrClosed
+	}
+
+	s.mu.Lock()
+	for len(s.txBuf) > TxBufHighWater && !s.closeReq {
+		deadline := currentDeadline(deadlineFn)
+		if deadlineExpired(deadline) || !timer.refresh(deadline) {
+			s.mu.Unlock()
+			budget.Release(len(data))
+			return context.DeadlineExceeded
+		}
+		s.txCond.Wait()
+	}
+	if s.closeReq {
+		s.mu.Unlock()
+		budget.Release(len(data))
+		return ErrClosed
+	}
+	if s.txBuf == nil {
+		capHint := txBufInitialCap
+		if len(data) > capHint {
+			capHint = len(data)
+		}
+		s.txBuf = make([]byte, 0, capHint)
 	}
 	s.txBuf = append(s.txBuf, data...)
 	if s.firstQueuedAt.IsZero() {
@@ -182,12 +471,79 @@ func (s *Session) EnqueueInitialData(data []byte) {
 	if cb != nil {
 		cb()
 	}
+	return nil
+}
+
+// WakeTxWaiters wakes writers blocked on this session or its shared TX budget.
+// It is used when a net.Conn write deadline changes while a Write is already
+// blocked.
+func (s *Session) WakeTxWaiters() {
+	s.mu.Lock()
+	budget := s.txBudget
+	s.txCond.Broadcast()
+	s.mu.Unlock()
+	budget.Wake()
+}
+
+type condDeadlineTimer struct {
+	cond     *sync.Cond
+	timer    *time.Timer
+	deadline time.Time
+}
+
+func newCondDeadlineTimer(cond *sync.Cond) *condDeadlineTimer {
+	return &condDeadlineTimer{cond: cond}
+}
+
+func (t *condDeadlineTimer) refresh(deadline time.Time) bool {
+	if deadline.IsZero() {
+		t.stop()
+		t.deadline = time.Time{}
+		return true
+	}
+	if deadlineExpired(deadline) {
+		return false
+	}
+	if t.timer != nil && t.deadline.Equal(deadline) {
+		return true
+	}
+	t.stop()
+	t.deadline = deadline
+	d := time.Until(deadline)
+	if d <= 0 {
+		return false
+	}
+	t.timer = time.AfterFunc(d, func() {
+		t.cond.Broadcast()
+	})
+	return true
+}
+
+func (t *condDeadlineTimer) stop() {
+	if t.timer == nil {
+		return
+	}
+	t.timer.Stop()
+	t.timer = nil
+}
+
+func currentDeadline(deadlineFn func() time.Time) time.Time {
+	if deadlineFn == nil {
+		return time.Time{}
+	}
+	return deadlineFn()
+}
+
+func deadlineExpired(deadline time.Time) bool {
+	return !deadline.IsZero() && !time.Now().Before(deadline)
 }
 
 // RequestClose marks the session for shutdown. The next DrainTx will emit a
 // FIN frame, and EnqueueTx becomes a no-op.
 func (s *Session) RequestClose() {
 	s.mu.Lock()
+	s.txClosed.Store(true)
+	budget := s.txBudget
 	s.closeReq = true
 	if s.firstQueuedAt.IsZero() {
 		s.firstQueuedAt = time.Now()
@@ -195,19 +551,16 @@ func (s *Session) RequestClose() {
 	s.txCond.Broadcast()
 	cb := s.OnTx
 	s.mu.Unlock()
+	budget.Wake()
 	if cb != nil {
 		cb()
 	}
 }
 
-// CloseRx closes RxChan if not already closed. Idempotent.
+// CloseRx requests receive-side shutdown. The rxLoop owns RxChan closure; this
+// method is kept for old callers without racing close(RxChan) against delivery.
 func (s *Session) CloseRx() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.rxClosed {
-		s.rxClosed = true
-		close(s.RxChan)
-	}
+	s.Stop()
 }
 
 // HasPendingTx reports whether DrainTx would emit at least one frame.
@@ -251,55 +604,61 @@ func (s *Session) IsDone() bool {
 	return false
 }
 
-// DrainSnapshot captures the pre-drain state of a session so the caller can
-// roll back via RollbackDrain if the batch carrying the drained frames cannot
-// be transmitted. The snapshot is opaque to callers.
+// DrainSnapshot captures the part of a drain that must be restored if the
+// caller knows the batch did not reach the relay. The snapshot is opaque to
+// callers; use RollbackDrain to apply it.
 type DrainSnapshot struct {
 	synNeeded     bool
-	txBuf         []byte
+	drainedTx     []byte
 	txSeq         uint64
 	finSent       bool
 	finSentAt     time.Time
 	firstQueuedAt time.Time
+	budgetBytes   int
 }
 
 // DrainTx removes pending tx bytes and returns them as a sequence of frames,
 // each capped at maxPayload bytes. Emits a SYN frame first if needed, and a
 // trailing FIN frame if RequestClose was called and the FIN hasn't been sent yet.
 func (s *Session) DrainTx(maxPayload int) []*frame.Frame {
-	frames, _ := s.drainTx(maxPayload, 0, false)
+	frames, _ := s.drainTx(maxPayload, 0, 0, false)
 	return frames
 }
 
 // DrainTxLimited is like DrainTx but emits at most maxFrames frames in one
 // call (0 means unlimited). Remaining bytes stay queued for later polls.
 func (s *Session) DrainTxLimited(maxPayload, maxFrames int) []*frame.Frame {
-	frames, _ := s.drainTx(maxPayload, maxFrames, false)
+	frames, _ := s.drainTx(maxPayload, maxFrames, 0, false)
 	return frames
 }
 
-// DrainTxLimitedTxn is like DrainTxLimited but also returns a snapshot of the
-// pre-drain state. If the caller cannot transmit the returned frames (HTTP
-// error, decode failure, classified quota response, etc.), pass the snapshot
-// to RollbackDrain to restore the session. If the transmission succeeds, the
-// snapshot is discarded — the drained state is already applied.
-//
-// Any data enqueued via EnqueueTx between this call and a RollbackDrain is
-// preserved; rollback restores the unsent prefix and then keeps the new data
-// after it.
-func (s *Session) DrainTxLimitedTxn(maxPayload, maxFrames int) ([]*frame.Frame, *DrainSnapshot) {
-	return s.drainTx(maxPayload, maxFrames, true)
+// DrainTxLimitedByBudget is like DrainTxLimited but also caps payload bytes
+// emitted in one call (0 means unlimited). It may split the next payload frame
+// below maxPayload to use the remaining byte budget while preserving sequence
+// order.
+func (s *Session) DrainTxLimitedByBudget(maxPayload, maxFrames, maxBytes int) []*frame.Frame {
+	frames, _ := s.drainTx(maxPayload, maxFrames, maxBytes, false)
+	return frames
 }
 
-func (s *Session) drainTx(maxPayload, maxFrames int, withSnapshot bool) ([]*frame.Frame, *DrainSnapshot) {
+// DrainTxLimitedByBudgetTxn is like DrainTxLimitedByBudget but also returns a
+// snapshot that can restore drained bytes and sequence state if the caller
+// knows the batch did not reach the relay.
+func (s *Session) DrainTxLimitedByBudgetTxn(maxPayload, maxFrames, maxBytes int) ([]*frame.Frame, *DrainSnapshot) {
+	return s.drainTx(maxPayload, maxFrames, maxBytes, true)
+}
+
+func (s *Session) drainTx(maxPayload, maxFrames, maxBytes int, withSnapshot bool) ([]*frame.Frame, *DrainSnapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
+	drainedBytes := 0
 	var snap *DrainSnapshot
+	var preDrainTx []byte
+
 	if withSnapshot {
+		preDrainTx = s.txBuf
 		snap = &DrainSnapshot{
 			synNeeded:     s.synNeeded,
-			txBuf:         s.txBuf,
 			txSeq:         s.txSeq,
 			finSent:       s.finSent,
 			finSentAt:     s.finSentAt,
@@ -336,6 +695,20 @@ func (s *Session) drainTx(maxPayload, maxFrames int, withSnapshot bool) ([]*fram
 	canAppend := func() bool {
 		return maxFrames <= 0 || len(frames) < maxFrames
 	}
+	bytesLeft := maxBytes
+	canAppendPayload := func() bool {
+		return maxBytes <= 0 || bytesLeft > 0
+	}
+	nextPayloadSize := func(available int) int {
+		n := available
+		if n > maxPayload {
+			n = maxPayload
+		}
+		if maxBytes > 0 && n > bytesLeft {
+			n = bytesLeft
+		}
+		return n
+	}
 
 	// SYN (possibly with first chunk of payload).
 	if s.synNeeded && canAppend() {
@@ -347,25 +720,23 @@ func (s *Session) drainTx(maxPayload, maxFrames int, withSnapshot bool) ([]*fram
 		}
 		s.txSeq++
 		s.synNeeded = false
-		if len(s.txBuf) > 0 {
-			n := len(s.txBuf)
-			if n > maxPayload {
-				n = maxPayload
-			}
+		if len(s.txBuf) > 0 && canAppendPayload() {
+			n := nextPayloadSize(len(s.txBuf))
 			// Zero-copy slice into txBuf. EncodeBatch seals the plaintext before
 			// the next drain, so the backing array is safe to reference here.
 			f.Payload = s.txBuf[:n]
 			s.txBuf = s.txBuf[n:]
+			drainedBytes += n
+			if maxBytes > 0 {
+				bytesLeft -= n
+			}
 		}
 		frames = append(frames, f)
 	}
 
 	// Remaining payload chunks.
-	for len(s.txBuf) > 0 && canAppend() {
-		n := len(s.txBuf)
-		if n > maxPayload {
-			n = maxPayload
-		}
+	for len(s.txBuf) > 0 && canAppend() && canAppendPayload() {
+		n := nextPayloadSize(len(s.txBuf))
 		f := &frame.Frame{
 			SessionID: s.ID,
 			Seq:       s.txSeq,
@@ -373,6 +744,10 @@ func (s *Session) drainTx(maxPayload, maxFrames int, withSnapshot bool) ([]*fram
 		}
 		s.txSeq++
 		s.txBuf = s.txBuf[n:]
+		drainedBytes += n
+		if maxBytes > 0 {
+			bytesLeft -= n
+		}
 		frames = append(frames, f)
 	}
 
@@ -404,53 +779,65 @@ func (s *Session) drainTx(maxPayload, maxFrames int, withSnapshot bool) ([]*fram
 	}
 
 	s.txCond.Broadcast() // wake any backpressured writers
+	s.txBudget.Release(drainedBytes)
 	if len(frames) == 0 {
-		// No frames produced — caller has nothing to roll back.
 		snap = nil
+	} else if snap != nil && drainedBytes > 0 {
+		snap.drainedTx = preDrainTx[:drainedBytes]
+		snap.budgetBytes = drainedBytes
 	}
 	return frames, snap
 }
 
-// RollbackDrain restores the session to the state captured in snap, undoing a
-// previous DrainTxLimitedTxn whose frames could not be transmitted. Any data
-// enqueued in the meantime is preserved (appended after the restored bytes).
-// Calling with a nil snapshot is a no-op.
+// RollbackDrain restores sequence/control state and prepends the drained byte
+// prefix to any bytes queued while the batch was in flight. It is only safe for
+// failures where the caller knows the relay did not accept the batch.
 func (s *Session) RollbackDrain(snap *DrainSnapshot) {
+	s.rollbackDrain(snap, true)
+}
+
+// RollbackDrainNoNotify restores a drain without invoking OnTx. It is for
+// callers that must restore several queues/control frames atomically before
+// waking the owner.
+func (s *Session) RollbackDrainNoNotify(snap *DrainSnapshot) {
+	s.rollbackDrain(snap, false)
+}
+
+func (s *Session) rollbackDrain(snap *DrainSnapshot, notify bool) {
 	if snap == nil {
 		return
 	}
 	s.mu.Lock()
-	// Merge: snapshot bytes (drained but unsent) first, then any new bytes
-	// queued during the in-flight window.
-	if len(snap.txBuf) > 0 {
+	if s.aborted {
+		s.txCond.Broadcast()
+		s.mu.Unlock()
+		s.txBudget.Wake()
+		return
+	}
+	if len(snap.drainedTx) > 0 {
 		if len(s.txBuf) == 0 {
-			s.txBuf = snap.txBuf
+			s.txBuf = snap.drainedTx
 		} else {
-			merged := make([]byte, 0, len(snap.txBuf)+len(s.txBuf))
-			merged = append(merged, snap.txBuf...)
+			merged := make([]byte, 0, len(snap.drainedTx)+len(s.txBuf))
+			merged = append(merged, snap.drainedTx...)
 			merged = append(merged, s.txBuf...)
 			s.txBuf = merged
 		}
 	}
-	if snap.synNeeded {
-		s.synNeeded = true
-	}
-	// txSeq must reset so retransmitted frames carry the same seq numbers the
-	// server would have seen on the first (lost) attempt.
+	s.synNeeded = snap.synNeeded
 	s.txSeq = snap.txSeq
-	if !snap.finSent {
-		s.finSent = false
-		s.finSentAt = time.Time{}
-	}
+	s.finSent = snap.finSent
+	s.finSentAt = snap.finSentAt
 	if !snap.firstQueuedAt.IsZero() {
 		if s.firstQueuedAt.IsZero() || snap.firstQueuedAt.Before(s.firstQueuedAt) {
 			s.firstQueuedAt = snap.firstQueuedAt
 		}
 	}
+	s.txBudget.Reclaim(snap.budgetBytes)
 	cb := s.OnTx
 	s.txCond.Broadcast()
 	s.mu.Unlock()
-	if cb != nil {
+	if notify && cb != nil {
 		cb()
 	}
 }
@@ -464,10 +851,20 @@ func (s *Session) RollbackDrain(snap *DrainSnapshot) {
 // drops under multi-user fan-out and brief GC pauses.
 func (s *Session) ProcessRx(f *frame.Frame) {
 	s.mu.Lock()
+	if f.Seq < s.rxSeq {
+		ackNext := s.rxAckSeq
+		cb := s.OnRxAdvance
+		s.mu.Unlock()
+		if cb != nil && ackNext > f.Seq {
+			cb(ackNext)
+		}
+		return
+	}
 	if s.rxClosed {
 		s.mu.Unlock()
 		return
 	}
+	f = cloneRxFramePayload(f)
 	s.mu.Unlock()
 	// Fast path: enqueue without blocking when there is room.
 	select {
@@ -486,7 +883,7 @@ func (s *Session) ProcessRx(f *frame.Frame) {
 	case s.rxInbox <- f:
 	case <-s.rxDone:
 	case <-t.C:
-		s.Stop()
+		s.abortReceive("rx_inbox_timeout")
 	}
 }
 
@@ -495,27 +892,41 @@ func (s *Session) ProcessRx(f *frame.Frame) {
 // and the session's rx side is done.
 func (s *Session) deliverRx(f *frame.Frame) bool {
 	s.mu.Lock()
+	if f.Seq < s.rxSeq {
+		ackNext := s.rxAckSeq
+		cb := s.OnRxAdvance
+		s.mu.Unlock()
+		if cb != nil && ackNext > f.Seq {
+			cb(ackNext)
+		}
+		return false
+	}
 	if s.rxClosed {
 		s.mu.Unlock()
 		return true
 	}
-	if f.Seq < s.rxSeq {
-		s.mu.Unlock()
-		return false
-	}
 	if f.Seq > s.rxSeq {
-		s.rxQueue[f.Seq] = f
+		if _, exists := s.rxQueue[f.Seq]; !exists {
+			if len(s.rxQueue) >= rxReorderCap {
+				s.mu.Unlock()
+				s.abortReceive("rx_reorder_overflow")
+				return true
+			}
+			s.rxQueue[f.Seq] = f
+		}
 		s.mu.Unlock()
 		return false
 	}
 
 	var toSend [][]byte
 	var closeAfter bool
+	var ackNext uint64
 	for {
 		if len(f.Payload) > 0 {
 			toSend = append(toSend, f.Payload)
 		}
 		s.rxSeq++
+		ackNext = s.rxSeq
 		if f.HasFlag(frame.FlagFIN) {
 			s.rxClosed = true
 			closeAfter = true
@@ -542,9 +953,36 @@ func (s *Session) deliverRx(f *frame.Frame) bool {
 			return true
 		}
 	}
+	s.mu.Lock()
+	if ackNext > s.rxAckSeq {
+		s.rxAckSeq = ackNext
+	}
+	cb := s.OnRxAdvance
+	s.mu.Unlock()
+	if cb != nil && ackNext > 0 {
+		cb(ackNext)
+	}
 	if closeAfter {
 		close(s.RxChan)
 		s.Stop()
 	}
 	return closeAfter
+}
+
+func cloneRxFramePayload(f *frame.Frame) *frame.Frame {
+	if len(f.Payload) == 0 {
+		return f
+	}
+	cp := *f
+	cp.Payload = clonePayload(f.Payload)
+	return &cp
+}
+
+func clonePayload(p []byte) []byte {
+	if len(p) == 0 {
+		return nil
+	}
+	cp := make([]byte, len(p))
+	copy(cp, p)
+	return cp
 }

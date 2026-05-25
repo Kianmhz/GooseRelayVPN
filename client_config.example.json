@@ -1,22 +1,130 @@
 {
+  "_comment_debug_timing": "Set true only when diagnosing latency; it adds detailed timing logs.",
   "debug_timing": false,
+
+  "_comment_stats_json": "Set true to emit periodic stats as JSON log lines for later analysis.",
+  "stats_json": false,
+
+  "_comment_debug_pprof_addr": "Optional local pprof listen address for deep profiling, e.g. 127.0.0.1:6060. Leave empty unless actively profiling.",
+  "debug_pprof_addr": "",
+
+  "_comment_write_startup_diagnostics": "Set true to write one redacted diagnostics zip on startup, then continue running normally.",
+  "write_startup_diagnostics": false,
+
+  "_comment_diagnostics_output_dir": "Directory for startup diagnostics zips. Relative paths are created beside the client binary. Empty uses diagnostics/ beside the binary.",
+  "diagnostics_output_dir": "diagnostics",
+
+  "_comment_save_terminal_log": "Set true during field tests to keep printing logs in the terminal and also save the same run to a .log file for later debugging. Terminal logs are not redacted; review destination hostnames/IPs and any full direct URLs/tokens before sharing.",
+  "save_terminal_log": false,
+
+  "_comment_terminal_log_file": "Optional log filename/prefix for save_terminal_log. Relative paths are created beside the client binary. Empty auto-creates logs/goose-client-YYYYMMDD-HHMMSS.log. A custom path still creates a fresh timestamped file every run.",
+  "terminal_log_file": "",
+
+  "_comment_socks_host": "Local SOCKS5 listen host. Use 127.0.0.1 for this device only. If you use 0.0.0.0 for LAN sharing, also set socks_user and socks_pass.",
   "socks_host": "127.0.0.1",
+
+  "_comment_socks_port": "Local SOCKS5 listen port used by your browser, app, or VPN client.",
   "socks_port": 1080,
+
+  "_comment_google_host": "Google edge IP/host dialed for Apps Script domain fronting. This is not your VPS. Keep the default unless the startup probe or logs show bad Google routing, then test another 216.239.x.120 address.",
   "google_host": "216.239.38.120",
+
+  "_comment_sni": "Google SNI names to rotate across. If the startup probe drops one host but keeps another, that is OK; the client will use the healthy hosts.",
   "sni": ["www.google.com", "mail.google.com", "accounts.google.com"],
-  "_comment_script_keys": "Add more entries here for extra deployments/accounts, e.g. {\"id\":\"AKfycb...\",\"account\":\"acct-b\"}. Deployments with the same account label share one Apps Script daily quota bucket.",
+
+  "_comment_fronting_http_version": "Fronting HTTP version. auto keeps current HTTP/2-first behavior; h1 can be tested on lossy mobile networks; h2 forces HTTP/2.",
+  "fronting_http_version": "auto",
+
+  "_comment_transport_mode": "Default is apps_script, the safest fronted mode when direct VPS access is blocked. Set auto only when you intentionally configured direct_stream_urls or relay_urls and want the client to try that direct path.",
+  "transport_mode": "apps_script",
+
+  "_comment_direct_stream_urls": "Optional direct VPS WebSocket /stream endpoints, e.g. ws://YOUR.VPS.IP:8443/stream. Only used when transport_mode is auto or direct_stream. Use wss:// only behind your own TLS reverse proxy. Leave empty when direct VPS access is blocked or unstable.",
+  "direct_stream_urls": [],
+
+  "_comment_relay_urls": "Optional direct VPS POST /tunnel endpoints, e.g. http://YOUR.VPS.IP:8443/tunnel. Only used when transport_mode is auto or direct_post; otherwise leave empty for normal Apps Script/fronting use.",
+  "relay_urls": [],
+
+  "_comment_downstream_replay_mode": "Lost-response recovery for Apps Script/direct POST. auto activates only when the server advertises support. It helps videos/downloads survive lost Google/mobile HTTP responses; direct stream is unchanged.",
+  "downstream_replay_mode": "auto",
+
+  "_comment_fresh_start_reset": "When true, each client startup asks the VPS to close stale tunnel sessions from the previous run of this same client instance. This makes Ctrl+C then start feel fresh without restarting the VPS process. It cannot reset Google quota.",
+  "fresh_start_reset": true,
+
+  "_comment_client_instance_id": "Optional stable label for this device/client, e.g. phone-main. Leave empty and the client creates .goose-client-instance beside this config. Do not reuse the same ID on two devices running at the same time.",
+  "client_instance_id": "",
+
+  "_comment_client_instance_id_file": "Optional file for the auto-generated client_instance_id. Relative paths are stored beside this config. Leave empty for .goose-client-instance beside this config.",
+  "client_instance_id_file": "",
+
+  "_comment_quota_state_path": "Persists only daily quota quarantines so restarting does not keep retrying accounts already known to be quota-dead today. Empty string disables persistence; default is .goose-quota-state.json beside this config.",
+  "quota_state_path": ".goose-quota-state.json",
+
+  "_comment_script_keys": "Apps Script deployment IDs. Add more entries for extra deployments/accounts, e.g. {\"id\":\"AKfycb...\",\"account\":\"acct-b\"}. Deployments with the same account label share one Apps Script quota/idle bucket.",
   "script_keys": [
     {"id": "REPLACE_WITH_DEPLOYMENT_ID", "account": "acct-a"}
   ],
+
+  "_comment_tunnel_key": "64 hex characters. Must exactly match server_config.json tunnel_key.",
   "tunnel_key": "REPLACE_WITH_64_HEX_CHARACTER_RANDOM_KEY",
 
-  "_comment_socks_auth": "Optional: require SOCKS5 username/password (RFC 1929). Both fields must be set together or both omitted.",
+  "_comment_socks_auth": "Optional SOCKS5 username/password. Set both fields or leave both empty.",
   "socks_user": "",
   "socks_pass": "",
 
-  "_comment_coalesce": "Optional: adaptive uplink coalescing. Set coalesce_step_ms to a positive number to make a burst of TX operations wait a little for more operations before sending, which reduces Apps Script calls. A good starting range is 20-40 ms. Set it to 0 to turn coalescing off.",
+  "_comment_max_local_sessions": "Optional cap on concurrent local SOCKS sessions accepted by the SOCKS listener. 0 means no extra listener cap, but the carrier still has a built-in storm guard (1024 active sessions and 80 new sessions/sec) to protect memory.",
+  "max_local_sessions": 0,
+
+  "_comment_performance_mode": "latency is best for browsing, YouTube start speed, Google Play, and chat apps. throughput uses bigger batches for stable bulk downloads but can feel slower on weak mobile links.",
+  "performance_mode": "latency",
+
+  "_comment_auto_tune": "When true, tunes only safe latency windows inside fixed caps. Beginners should leave false until they have logs showing a specific bottleneck.",
+  "auto_tune": false,
+
+  "_comment_coalesce_step_ms": "Client upload coalescing delay. 0 is best for low latency; 20-40 can reduce request count at the cost of delay.",
   "coalesce_step_ms": 0,
 
-  "_comment_idle_slots": "Optional download-throughput tuning. Default 2 (best balance for accounts with 2+ deployments). Lower to 1 if each account has only one deployment. Max 3. Omitting the field is equivalent to 2.",
-  "idle_slots_per_bucket": 2
+  "_comment_idle_slots_per_bucket": "Concurrent idle long-polls per Google account while active. Keep 1 for one deployment per account. Try 2 only when each Google account has 2+ deployments and you want more download push capacity. In a single-bucket pure-download burst the client may temporarily allow 2 idle polls for responsiveness even when this is 1.",
+  "idle_slots_per_bucket": 1,
+
+  "_comment_idle_poll_mode": "Apps Script quota saver. adaptive is recommended for 24/7 background clients: it stays responsive when active, then reduces idle quota burn. always is fastest while idle; off saves the most quota.",
+  "idle_poll_mode": "adaptive",
+
+  "_comment_idle_poll_max_buckets": "Max Google account buckets used by idle polls when there are zero active sessions. 2 prevents four-account configs from burning every account while idle.",
+  "idle_poll_max_buckets": 2,
+
+  "_comment_workers_per_endpoint": "POST poll workers per relay endpoint/deployment. 3 is the low-latency default. Higher values can reduce wait time but burn quota faster and can hit Apps Script simultaneous-execution limits. Changing this requires restarting the client.",
+  "workers_per_endpoint": 3,
+
+  "_comment_tx_slots_per_bucket": "Max concurrent active POSTs per Google account bucket. Default is 3, even if workers_per_endpoint is higher. Lower to 1-2 if one healthy account is being hammered after other accounts hit quota; raise to 4-8 only after logs prove the account handles it.",
+  "tx_slots_per_bucket": 3,
+
+  "_comment_poll_idle_sleep_ms": "Worker sleep after a no-work poll during active use. Lower is snappier but spins more often.",
+  "poll_idle_sleep_ms": 5,
+
+  "_comment_poll_timeout_ms": "Per relay HTTP request timeout. 300000 means 5 minutes. Apps Script UrlFetch has its own shorter server-side ceiling, so this mostly protects slow fronting/client downloads and direct relay modes.",
+  "poll_timeout_ms": 300000,
+
+  "_comment_endpoint_blacklist_base_ms": "Initial retry backoff for a failing relay endpoint.",
+  "endpoint_blacklist_base_ms": 3000,
+
+  "_comment_endpoint_blacklist_max_ms": "Maximum retry backoff for repeatedly failing relay endpoints.",
+  "endpoint_blacklist_max_ms": 3600000,
+
+  "_comment_endpoint_outage_grace_ms": "How long to hold active sessions during local/mobile internet outages. 300000 means 5 minutes. Relay-side HTML/404 errors use a shorter internal grace so bad deployments fail faster.",
+  "endpoint_outage_grace_ms": 300000,
+
+  "_comment_max_request_bytes_pre_encode": "Max plaintext batch size before encryption/base64. Keep at 8 MiB for Apps Script safety.",
+  "max_request_bytes_pre_encode": 8388608,
+
+  "_comment_tx_buffer_budget_bytes": "Global queued upload buffer budget across all local sessions. 64 MiB protects Android/Termux from tab explosions without limiting one normal upload.",
+  "tx_buffer_budget_bytes": 67108864,
+
+  "_comment_stream_connect_timeout_ms": "Direct WebSocket stream connect timeout. Only used when direct_stream_urls is configured.",
+  "stream_connect_timeout_ms": 5000,
+
+  "_comment_stream_ping_interval_ms": "Direct stream ping interval. Only used when direct_stream_urls is configured.",
+  "stream_ping_interval_ms": 20000,
+
+  "_comment_stream_reconnect_backoff_ms": "Direct stream reconnect delay after disconnect. Keep low for fast recovery.",
+  "stream_reconnect_backoff_ms": 1000
 }

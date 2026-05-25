@@ -1,8 +1,82 @@
 {
+  "_comment_server_host": "IP/interface for the VPS exit server to listen on. 0.0.0.0 accepts external connections.",
   "server_host": "0.0.0.0",
+
+  "_comment_server_port": "TCP port for /healthz, /tunnel, and /stream. Must match Code.gs RELAY_URLS and VPS firewall rules.",
   "server_port": 8443,
+
+  "_comment_tunnel_key": "Same 64-character hex key as client_config.json tunnel_key.",
   "tunnel_key": "SAME_VALUE_AS_CLIENT_tunnel_key",
-  "_comment_upstream_proxy": "Optional: set to socks5://127.0.0.1:40000 only after installing and connecting Cloudflare WARP or another local SOCKS5 proxy on the VPS. Leave empty otherwise.",
+
+  "_comment_upstream_proxy": "Optional SOCKS5 proxy for VPS outbound traffic, e.g. socks5://127.0.0.1:40000 for local WARP, or socks5://user:pass@host:port if your proxy requires auth. Leave empty for direct VPS egress.",
   "upstream_proxy": "",
-  "debug_timing": false
+
+  "_comment_debug_timing": "Set true only while diagnosing VPS-side DNS/TCP dial latency.",
+  "debug_timing": false,
+
+  "_comment_stats_json": "Set true to emit periodic server stats as JSON log lines for later analysis.",
+  "stats_json": false,
+
+  "_comment_debug_pprof_addr": "Optional local pprof listen address for deep profiling, e.g. 127.0.0.1:6061. Leave empty unless actively profiling.",
+  "debug_pprof_addr": "",
+
+  "_comment_write_startup_diagnostics": "Set true to write one redacted diagnostics zip on startup, then continue running normally.",
+  "write_startup_diagnostics": false,
+
+  "_comment_diagnostics_output_dir": "Directory for startup diagnostics zips. Relative paths are created beside the server binary. Empty uses diagnostics/ beside the binary. Docker Compose maps ./diagnostics to /app/diagnostics.",
+  "diagnostics_output_dir": "diagnostics",
+
+  "_comment_save_terminal_log": "Set true during field tests to keep printing logs in the terminal and also save the same run to a .log file for later debugging. Terminal logs are not redacted; review destination hostnames/IPs and any full direct URLs/tokens before sharing.",
+  "save_terminal_log": false,
+
+  "_comment_terminal_log_file": "Optional log filename/prefix for save_terminal_log. Relative paths are created beside the server binary. Empty auto-creates logs/goose-server-YYYYMMDD-HHMMSS.log. A custom path still creates a fresh timestamped file every run.",
+  "terminal_log_file": "",
+
+  "_comment_auto_tune": "When true, adjusts only active_drain_window_ms and coalesce windows inside fixed safety caps. Beginners should leave false until real logs show a tuning need.",
+  "auto_tune": false,
+
+  "_comment_performance_mode": "latency is best for browsing, video start, Google Play, and chat apps. throughput uses larger waits for stable bulk downloads but can make weak mobile links feel slower.",
+  "performance_mode": "latency",
+
+  "_comment_active_drain_window_ms": "Max time the server waits for downstream data after receiving client frames. Lower improves page-start latency.",
+  "active_drain_window_ms": 150,
+
+  "_comment_long_poll_window_ms": "Max time the server holds an idle poll open. 8000 reduces idle Apps Script quota burn versus 6000 while active data still returns immediately.",
+  "long_poll_window_ms": 8000,
+
+  "_comment_upstream_dial_timeout_ms": "TCP dial timeout from VPS to target websites. 8000 fails dead edges faster than the conservative default.",
+  "upstream_dial_timeout_ms": 8000,
+
+  "_comment_coalesce_window_ms": "Server response coalescing while not busy. 0 is best for low latency.",
+  "coalesce_window_ms": 0,
+
+  "_comment_coalesce_window_busy_ms": "Server response coalescing while many sessions are active. 0 keeps responses immediate.",
+  "coalesce_window_busy_ms": 0,
+
+  "_comment_max_sessions": "Maximum concurrent server-side tunnel sessions. Protects small VPS instances from connection storms.",
+  "max_sessions": 4096,
+
+  "_comment_max_drain_frames_per_session": "Server-only download fairness knob. It limits how many 256 KiB downstream frames one hot TCP session can take from a single server response. 8 is the safe browsing/video default (about 2 MiB plaintext per response for one session). 16 is a good first bulk-download test (about 4 MiB). 24 and 32 are increasingly aggressive for single large downloads; they can improve Google Play-style downloads, but other tabs/videos may wait longer and Apps Script responses get larger. Keep 8 for mixed browsing, try 16 first for download testing, then try 24 or 32 only if quota, latency, and packet loss stay healthy.",
+  "max_drain_frames_per_session": 8,
+
+  "_comment_max_request_body_bytes": "Max encrypted HTTP request body accepted by /tunnel. 12 MiB fits the default 8 MiB upload batch after Apps Script/base64 expansion while limiting unauthenticated request memory.",
+  "max_request_body_bytes": 12582912,
+
+  "_comment_max_response_bytes_pre_encode": "Max plaintext response batch before encryption/base64 after the startup ramp. 2097152 is safest for unstable Android/mobile links; 4194304 is conservative; 6291456 is the balanced download default. With replay enabled, keep this at or below 8388608. Raising toward 23068672 is expert-only for stable links with replay disabled.",
+  "max_response_bytes_pre_encode": 6291456,
+
+  "_comment_initial_response_cap_enabled": "Set false to ignore initial_response_bytes_pre_encode without editing the byte number. Useful for maximum bulk-download testing.",
+  "initial_response_cap_enabled": true,
+
+  "_comment_initial_response_bytes_pre_encode": "Caps each session's first downstream response so headers and first bytes reach the browser quickly when initial_response_cap_enabled is true.",
+  "initial_response_bytes_pre_encode": 524288,
+
+  "_comment_second_response_cap_enabled": "Set false to ignore second_response_bytes_pre_encode without editing the byte number.",
+  "second_response_cap_enabled": true,
+
+  "_comment_second_response_bytes_pre_encode": "Caps each session's second downstream response when second_response_cap_enabled is true. 1048576 is smoother for Apps Script/mobile video starts; try 2097152 only if downloads are stable and quota is healthy.",
+  "second_response_bytes_pre_encode": 1048576,
+
+  "_comment_downstream_replay_enabled": "Lost-response recovery for Apps Script/direct POST. Keep enabled for mobile/video continuity when the client uses downstream_replay_mode=auto. It uses bounded VPS memory to replay lost downstream responses; it is for reliability, not raw speed.",
+  "downstream_replay_enabled": true
 }
