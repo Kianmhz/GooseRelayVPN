@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -191,6 +195,11 @@ type Config struct {
 	AESKeyHex   string // 64-char hex, must match server
 	DebugTiming bool   // when true, log per-session TTFB and per-poll Apps Script RTT
 
+	// QuotaStatePath persists durable Apps Script quota quarantines across
+	// client restarts. Empty disables persistence. Only quota walls are stored;
+	// transient network/backoff state remains in memory.
+	QuotaStatePath string
+
 	// CoalesceStep / CoalesceMax enable adaptive uplink coalescing on kick().
 	// When CoalesceStep > 0 the first kick of a burst arms a step timer; each
 	// subsequent kick within the window resets it, bounded by CoalesceMax from
@@ -211,6 +220,7 @@ type relayEndpoint struct {
 	account             string // optional human-readable Google account label, "" = unlabeled
 	blacklistedTill     time.Time
 	localNetworkOffline bool
+	quotaExhaustedUntil time.Time
 	failCount           int
 	statsOK             uint64
 	statsFail           uint64
@@ -281,6 +291,8 @@ type Client struct {
 	bucketCount        int // distinct in-flight buckets; one per labeled account, plus one per unlabeled endpoint
 	idleSlotsPerBucket int // resolved from Config.IdleSlotsPerBucket; max concurrent polls per bucket
 	clientVersion      string
+	quotaStatePath     string
+	quotaStateMu       sync.Mutex
 
 	// clientID is a random 16-byte identifier minted once per process. It is
 	// embedded in every encrypted batch so the server can route downstream
@@ -426,7 +438,7 @@ func New(cfg Config) (*Client, error) {
 			numWorkers, len(endpoints), idleSlotsPerBucket)
 	}
 
-	return &Client{
+	c := &Client{
 		cfg:                cfg,
 		aead:               aead,
 		httpClients:        NewFrontedClients(cfg.Fronting, pollTimeout, endpoints[0].url),
@@ -435,6 +447,7 @@ func New(cfg Config) (*Client, error) {
 		bucketCount:        bucketCount,
 		idleSlotsPerBucket: idleSlotsPerBucket,
 		clientVersion:      cfg.ClientVersion,
+		quotaStatePath:     strings.TrimSpace(cfg.QuotaStatePath),
 		clientID:           clientID,
 		sessions:           make(map[[frame.SessionIDLen]byte]*session.Session),
 		inFlight:           make(map[[frame.SessionIDLen]byte]bool),
@@ -445,7 +458,13 @@ func New(cfg Config) (*Client, error) {
 		coalesceStep:       cfg.CoalesceStep,
 		coalesceMax:        cfg.CoalesceMax,
 		recoveryProbeAddr:  recoveryProbeAddress(cfg),
-	}, nil
+	}
+	if c.quotaStatePath != "" {
+		if err := c.loadQuotaState(c.quotaStatePath); err != nil {
+			log.Printf("[carrier] WARN: quota state load skipped: %v", err)
+		}
+	}
+	return c, nil
 }
 
 // NewSession creates a tunneled session for target ("host:port") and registers
@@ -855,7 +874,11 @@ func (c *Client) pollOnce(ctx context.Context) bool {
 		if isLikelyNonBatchRelayPayload(respBody) {
 			errReason, errHard := classifyRelayErrorBody(respBody)
 			if errHard {
-				c.markEndpointHardFailure(endpointIdx)
+				if strings.Contains(strings.ToLower(errReason), "quota") {
+					c.markEndpointQuotaExhausted(endpointIdx)
+				} else {
+					c.markEndpointHardFailure(endpointIdx)
+				}
 			} else {
 				c.markEndpointFailure(endpointIdx)
 			}
@@ -944,7 +967,7 @@ func (c *Client) pickRelayEndpoint() (int, string) {
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
 		ep := &c.endpoints[idx]
-		if ep.blacklistedTill.After(now) {
+		if c.endpointUnavailableLocked(ep, now) {
 			continue
 		}
 		c.nextEndpoint = (idx + 1) % n
@@ -975,7 +998,7 @@ func (c *Client) pickIdleEndpoint() (int, string) {
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
 		ep := &c.endpoints[idx]
-		if ep.blacklistedTill.After(now) {
+		if c.endpointUnavailableLocked(ep, now) {
 			continue
 		}
 		if c.inFlightByBucket[ep.bucket] >= c.idleSlotsPerBucket {
@@ -1003,6 +1026,10 @@ func (c *Client) releaseBucketSlot(idx int) {
 	if c.inFlightByBucket[bucket] > 0 {
 		c.inFlightByBucket[bucket]--
 	}
+}
+
+func (c *Client) endpointUnavailableLocked(ep *relayEndpoint, now time.Time) bool {
+	return ep.blacklistedTill.After(now) || ep.quotaExhaustedUntil.After(now)
 }
 
 func (c *Client) resetLocalNetworkFailures() int {
@@ -1087,6 +1114,144 @@ func (c *Client) markEndpoint429(endpointIdx int) {
 // Same backoff tier as markEndpoint403.
 func (c *Client) markEndpointHardFailure(endpointIdx int) {
 	c.markEndpointFailureWith(endpointIdx, 5)
+}
+
+func endpointQuotaKey(ep *relayEndpoint) string {
+	if ep.account != "" {
+		return "account:" + ep.account
+	}
+	sum := sha256.Sum256([]byte(ep.url))
+	return "urlsha256:" + hex.EncodeToString(sum[:])
+}
+
+type quotaStateFile struct {
+	Version int               `json:"version"`
+	Entries []quotaStateEntry `json:"entries"`
+}
+
+type quotaStateEntry struct {
+	Key   string    `json:"key"`
+	Until time.Time `json:"until"`
+}
+
+func (c *Client) loadQuotaState(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	var state quotaStateFile
+	if err := json.Unmarshal(b, &state); err != nil {
+		return err
+	}
+	byKey := make(map[string]time.Time, len(state.Entries))
+	now := time.Now()
+	for _, entry := range state.Entries {
+		key := strings.TrimSpace(entry.Key)
+		if key == "" || !entry.Until.After(now) {
+			continue
+		}
+		if prev := byKey[key]; prev.IsZero() || entry.Until.After(prev) {
+			byKey[key] = entry.Until
+		}
+	}
+	if len(byKey) == 0 {
+		return nil
+	}
+	c.endpointMu.Lock()
+	defer c.endpointMu.Unlock()
+	for i := range c.endpoints {
+		ep := &c.endpoints[i]
+		until := byKey[endpointQuotaKey(ep)]
+		if until.IsZero() {
+			continue
+		}
+		ep.quotaExhaustedUntil = until
+		ep.blacklistedTill = until
+		ep.localNetworkOffline = false
+	}
+	return nil
+}
+
+func (c *Client) saveQuotaState() error {
+	path := strings.TrimSpace(c.quotaStatePath)
+	if path == "" {
+		return nil
+	}
+	now := time.Now()
+	byKey := make(map[string]time.Time)
+	c.endpointMu.Lock()
+	for i := range c.endpoints {
+		ep := &c.endpoints[i]
+		c.touchDailyWindow(ep, now)
+		if !ep.quotaExhaustedUntil.After(now) {
+			continue
+		}
+		key := endpointQuotaKey(ep)
+		if prev := byKey[key]; prev.IsZero() || ep.quotaExhaustedUntil.After(prev) {
+			byKey[key] = ep.quotaExhaustedUntil
+		}
+	}
+	c.endpointMu.Unlock()
+
+	state := quotaStateFile{Version: 1, Entries: make([]quotaStateEntry, 0, len(byKey))}
+	for key, until := range byKey {
+		state.Entries = append(state.Entries, quotaStateEntry{Key: key, Until: until})
+	}
+	body, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	c.quotaStateMu.Lock()
+	defer c.quotaStateMu.Unlock()
+	return writeFileAtomic(path, append(body, '\n'), 0o600)
+}
+
+func (c *Client) markEndpointQuotaExhausted(endpointIdx int) {
+	c.endpointMu.Lock()
+	if endpointIdx < 0 || endpointIdx >= len(c.endpoints) {
+		c.endpointMu.Unlock()
+		return
+	}
+	now := time.Now()
+	ep := &c.endpoints[endpointIdx]
+	c.touchDailyWindow(ep, now)
+	resetAt := ep.dailyResetAt
+	if resetAt.IsZero() {
+		resetAt = nextQuotaReset(now)
+	}
+	url := ep.url
+	account := ep.account
+	scopeAccount := account != ""
+	for i := range c.endpoints {
+		if scopeAccount {
+			if c.endpoints[i].account != account {
+				continue
+			}
+		} else if i != endpointIdx {
+			continue
+		}
+		peer := &c.endpoints[i]
+		c.touchDailyWindow(peer, now)
+		peer.quotaExhaustedUntil = resetAt
+		peer.blacklistedTill = resetAt
+		peer.localNetworkOffline = false
+		if i == endpointIdx {
+			peer.failCount++
+			peer.statsFail++
+		}
+	}
+	c.endpointMu.Unlock()
+	log.Printf("[carrier] endpoint %s account=%q quota exhausted until approx %s; rotating away",
+		shortScriptKey(url), account, resetAt.Format(time.RFC3339))
+	if err := c.saveQuotaState(); err != nil {
+		log.Printf("[carrier] WARN: quota state save failed: %v", err)
+	}
 }
 
 // markEndpointFailureWith is the shared implementation. minFailCount is a floor

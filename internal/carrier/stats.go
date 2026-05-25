@@ -96,6 +96,10 @@ func (c *Client) endpointStatsLine() string {
 			remaining := time.Until(ep.blacklistedTill).Round(time.Second)
 			part = fmt.Sprintf("%s bl=%s", part, remaining)
 		}
+		if ep.quotaExhaustedUntil.After(now) {
+			remaining := time.Until(ep.quotaExhaustedUntil).Round(time.Second)
+			part = fmt.Sprintf("%s quota_reset=%s", part, remaining)
+		}
 		parts = append(parts, part)
 	}
 	return strings.Join(parts, " | ")

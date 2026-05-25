@@ -8,6 +8,8 @@
   "script_keys": [
     {"id": "REPLACE_WITH_DEPLOYMENT_ID", "account": "acct-a"}
   ],
+  "_comment_quota_state_path": "Persists only Apps Script quota quarantines so restarting the client does not immediately retry an account already known to be over quota. Empty string disables persistence.",
+  "quota_state_path": ".goose-quota-state.json",
   "tunnel_key": "REPLACE_WITH_64_HEX_CHARACTER_RANDOM_KEY",
 
   "_comment_socks_auth": "Optional: require SOCKS5 username/password (RFC 1929). Both fields must be set together or both omitted.",
