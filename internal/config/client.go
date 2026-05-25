@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -34,6 +35,11 @@ type Client struct {
 	// been spent. Index i in this slice is the account label for ScriptURLs[i];
 	// empty string = unlabeled. Always the same length as ScriptURLs.
 	ScriptAccounts []string
+
+	// QuotaStatePath persists durable Apps Script quota quarantines so a
+	// restart does not immediately hammer an account already known to be over
+	// its daily UrlFetch quota. Empty disables persistence.
+	QuotaStatePath string
 
 	// Adaptive uplink coalescing. When CoalesceStepMs > 0, the carrier waits
 	// up to that many ms for more TX ops to arrive before sending, resetting
@@ -86,6 +92,8 @@ type clientFile struct {
 	// Apps Script round-trip latency to help pinpoint where a slow connection
 	// is spending its time. Off by default.
 	DebugTiming bool `json:"debug_timing"`
+
+	QuotaStatePath *string `json:"quota_state_path"`
 
 	// Optional SOCKS5 RFC 1929 credentials. When set, clients must supply
 	// these credentials or the connection is rejected. Both must be non-empty
@@ -385,6 +393,14 @@ func LoadClient(path string) (*Client, error) {
 		return nil, fmt.Errorf("socks_user and socks_pass must both be set or both be empty in %s", path)
 	}
 
+	quotaStatePath := ".goose-quota-state.json"
+	if f.QuotaStatePath != nil {
+		quotaStatePath = strings.TrimSpace(*f.QuotaStatePath)
+	}
+	if quotaStatePath != "" && !filepath.IsAbs(quotaStatePath) {
+		quotaStatePath = filepath.Join(filepath.Dir(path), quotaStatePath)
+	}
+
 	if f.CoalesceStepMs < 0 {
 		return nil, fmt.Errorf("coalesce_step_ms must be >= 0 in %s (got %d)", path, f.CoalesceStepMs)
 	}
@@ -398,19 +414,20 @@ func LoadClient(path string) (*Client, error) {
 	}
 
 	c := Client{
-		ListenAddr:                  net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
-		GoogleIP:                    googleIP,
-		SNIHosts:                    sniHosts,
-		ScriptURLs:                  scriptURLs,
-		ScriptAccounts:              scriptAccounts,
-		UseFronting:                 useFronting,
-		AESKeyHex:                   key,
-		DebugTiming:                 f.DebugTiming,
-		SocksUser:                   socksUser,
-		SocksPass:                   socksPass,
-		CoalesceStepMs:              f.CoalesceStepMs,
-		CoalesceMaxMs:               coalesceMax,
-		IdleSlotsPerBucket:          f.IdleSlotsPerBucket,
+		ListenAddr:         net.JoinHostPort(listenHost, strconv.Itoa(listenPort)),
+		GoogleIP:           googleIP,
+		SNIHosts:           sniHosts,
+		ScriptURLs:         scriptURLs,
+		ScriptAccounts:     scriptAccounts,
+		UseFronting:        useFronting,
+		AESKeyHex:          key,
+		DebugTiming:        f.DebugTiming,
+		QuotaStatePath:     quotaStatePath,
+		SocksUser:          socksUser,
+		SocksPass:          socksPass,
+		CoalesceStepMs:     f.CoalesceStepMs,
+		CoalesceMaxMs:      coalesceMax,
+		IdleSlotsPerBucket: f.IdleSlotsPerBucket,
 	}
 	return &c, nil
 }

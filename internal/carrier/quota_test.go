@@ -1,6 +1,8 @@
 package carrier
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -132,5 +134,50 @@ func TestRecordScriptStatsFromBody_RecoveryAfterRedeploy(t *testing.T) {
 	}
 	if c.endpoints[0].scriptCount != 7 {
 		t.Fatalf("scriptCount=%d want 7", c.endpoints[0].scriptCount)
+	}
+}
+
+func TestMarkEndpointQuotaExhaustedScopesToAccountAndPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "quota.json")
+	now := time.Now()
+	c := &Client{
+		quotaStatePath: path,
+		endpoints: []relayEndpoint{
+			{url: "u1", account: "A", dailyResetAt: now.Add(time.Hour)},
+			{url: "u2", account: "A", dailyResetAt: now.Add(time.Hour)},
+			{url: "u3", account: "B", dailyResetAt: now.Add(time.Hour)},
+		},
+	}
+
+	c.markEndpointQuotaExhausted(0)
+
+	if !c.endpoints[0].quotaExhaustedUntil.After(now) {
+		t.Fatalf("endpoint 0 was not quota-quarantined")
+	}
+	if !c.endpoints[1].quotaExhaustedUntil.Equal(c.endpoints[0].quotaExhaustedUntil) {
+		t.Fatalf("same-account endpoint was not quarantined with endpoint 0")
+	}
+	if !c.endpoints[2].quotaExhaustedUntil.IsZero() {
+		t.Fatalf("different account was quarantined: %v", c.endpoints[2].quotaExhaustedUntil)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("quota state was not persisted: %v", err)
+	}
+
+	restored := &Client{
+		endpoints: []relayEndpoint{
+			{url: "u1", account: "A"},
+			{url: "u2", account: "A"},
+			{url: "u3", account: "B"},
+		},
+	}
+	if err := restored.loadQuotaState(path); err != nil {
+		t.Fatalf("loadQuotaState: %v", err)
+	}
+	if !restored.endpoints[0].blacklistedTill.After(now) || !restored.endpoints[1].blacklistedTill.After(now) {
+		t.Fatalf("restored same-account quota quarantine = %#v", restored.endpoints)
+	}
+	if !restored.endpoints[2].blacklistedTill.IsZero() {
+		t.Fatalf("restored different account blacklist = %v", restored.endpoints[2].blacklistedTill)
 	}
 }
