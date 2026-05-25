@@ -1,6 +1,6 @@
 // GooseRelay forwarder.
 //
-// Apps Script web app deployed as: Execute as: Me, Access: Anyone (or Anyone with Google account).
+// Apps Script web app deployed as: Execute as: Me, Access: Anyone.
 // All traffic is AES-GCM encrypted by the client; this script is a dumb pipe
 // and never sees plaintext or holds the key.
 //
@@ -10,28 +10,41 @@
 // Replace RELAY_URLS with your VPS address(es) before deploying.
 
 const RELAY_URLS = [
-  // Replace YOUR_SERVER_PORT with server_config.json's server_port.
-  // The dist/server_config.json used for the current test listens on 5443.
-  'http://YOUR.VPS.IP:YOUR_SERVER_PORT/tunnel',
+  // Replace YOUR.VPS.IP, and change 8443 only if server_config.json uses a different server_port.
+  'http://YOUR.VPS.IP:8443/tunnel',
 ];
-const FORWARDER_VERSION = 1;
+const FORWARDER_VERSION = 2;
 const PROTOCOL_VERSION = 1;
 const ENABLE_INVOCATION_COUNTING = false;
-const GAS_RELAY_LOOP_RE = /^https?:\/\/script\.google\.com\/macros\//i;
+// Valid client uploads are capped by max_request_body_bytes on the VPS
+// (12 MiB in the example configs). Reject larger public probes before
+// spending UrlFetch quota. Raise this only if you also raise the Go client and
+// server upload caps.
+const MAX_TUNNEL_PAYLOAD_CHARS = 12 * 1024 * 1024;
+// RELAY_URLS must point to the VPS /tunnel endpoint. If this script is pointed
+// back at an Apps Script web-app URL, each request can loop through Google and
+// burn quota without ever reaching the VPS. Cover the normal deployment URL,
+// Workspace-domain URLs, and googleusercontent redirect targets.
+const GAS_RELAY_LOOP_RE = /^https?:\/\/(?:script\.google\.com|script\.googleusercontent\.com)(?::\d+)?\/(?:macros|a\/macros\/[^/?#]+)(?:\/|$)/i;
+const BASE64_SAMPLE_RE = /^[A-Za-z0-9+/=]+$/;
 
 function doPost(e) {
   for (let i = 0; i < RELAY_URLS.length; i++) {
-    if (GAS_RELAY_LOOP_RE.test(RELAY_URLS[i])) {
-      // Throw so Apps Script returns HTTP 500. Returning 200 with this
-      // diagnostic text would be parsed by the client as a base64 batch and
-      // fail at the colon — see the v1.7.0 → v1.7.1 fix in client.go.
+    if (isAppsScriptRelayURL_(RELAY_URLS[i])) {
+      // Throw so Apps Script returns an HTTP error. Returning HTTP 200 with
+      // this diagnostic text would make clients parse it as a tunnel batch.
       throw new Error('relay_loop_detected: RELAY_URLS must point to your VPS /tunnel endpoint, not Apps Script');
     }
+  }
+  const payload = (e && e.postData && e.postData.contents) || '';
+  if (!looksLikeTunnelPayload_(payload)) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ e: 'bad_payload', body: 'POST body is not a GooseRelay encrypted batch' }))
+      .setMimeType(ContentService.MimeType.JSON);
   }
   if (ENABLE_INVOCATION_COUNTING) {
     bumpInvocationCount_();
   }
-  const payload = (e && e.postData && e.postData.contents) || '';
   let lastError = 'no RELAY_URLS configured';
   for (let i = 0; i < RELAY_URLS.length; i++) {
     try {
@@ -41,7 +54,6 @@ function doPost(e) {
         payload: payload,
         muteHttpExceptions: true,
         followRedirects: false,
-        deadline: 30,  // seconds; long-poll window is kept below this for Apps Script stability
       });
       const status = resp.getResponseCode();
       const text = resp.getContentText();
@@ -55,34 +67,60 @@ function doPost(e) {
       lastError = 'upstream fetch error: ' + String(err);
     }
   }
-  // All RELAY_URLS failed. Throw so Apps Script returns HTTP 500 with an
-  // HTML error page — the GooseRelay client's non-200 code path treats this
-  // as a clean endpoint failure and rotates to the next deployment. Returning
-  // 200 with a plain-text error body (as v1.7.0 did) was the cause of the
-  // "batch: base64 decode: illegal base64 data at input byte 9" client log
-  // spam: the client would try to base64-decode "upstream fetch error: …"
-  // and fail at the first colon.
+  // All RELAY_URLS failed. Throw so Apps Script returns HTTP 500 and the
+  // GooseRelay client treats this as a clean endpoint failure instead of
+  // trying to base64-decode an error string.
   throw new Error(lastError);
 }
 
-// doGet returns this deployment's per-day invocation count so the client can
-// log real per-deployment usage alongside its own client-side counter. The
-// day boundary tracks the Apps Script quota window (midnight Pacific). Format
-// is JSON so the client can parse without ambiguity:
-//   {"ok":true,"date":"2026-05-04","count":1234}
+function isAppsScriptRelayURL_(url) {
+  return GAS_RELAY_LOOP_RE.test(String(url || '').trim());
+}
+
+function looksLikeTunnelPayload_(payload) {
+  const text = String(payload || '');
+  // A valid empty encrypted GooseRelay text batch is roughly 63 base64 chars.
+  // Check only a small head/tail sample so multi-megabyte uploads don't spend
+  // Apps Script CPU scanning the whole body. The VPS crypto/frame decoder is
+  // still the authoritative full-body validator; this only filters obvious
+  // public web probes before spending UrlFetch quota.
+  if (text.length < 40) return false;
+  if (text.length > MAX_TUNNEL_PAYLOAD_CHARS) return false;
+  if (text.length % 4 === 1) return false;
+  const head = text.slice(0, 128);
+  const tail = text.length > 128 ? text.slice(-32) : '';
+  return BASE64_SAMPLE_RE.test(head) &&
+    (tail === '' || BASE64_SAMPLE_RE.test(tail));
+}
+
+// doGet returns this deployment's optional per-day web-app request count so the
+// client can show a rough local pressure signal alongside its own counter. This
+// is not an exact Google URL Fetch quota counter: one valid tunnel request may
+// try more than one RELAY_URLS entry, and rejected public probes may spend zero
+// UrlFetch calls. This Pacific date is only a human-readable local window;
+// Google documents Apps Script quotas as per-user windows that reset 24 hours
+// after first use.
+// Format is JSON so the client can parse without ambiguity:
+//   {"ok":true,"date":"2026-05-04","count":1234,"counting_enabled":true}
 function doGet(e) {
   if (e && e.parameter && e.parameter.legacy === '1') {
     return ContentService
       .createTextOutput('GooseRelay forwarder OK')
       .setMimeType(ContentService.MimeType.TEXT);
   }
-  const props = PropertiesService.getScriptProperties();
   const today = pacificDateKey_();
-  const count = parseInt(props.getProperty('count_' + today) || '0', 10);
+  let count = null;
+  if (ENABLE_INVOCATION_COUNTING) {
+    const props = PropertiesService.getScriptProperties();
+    count = parseInt(props.getProperty('count_' + today) || '0', 10);
+  }
   const out = {
     ok: true,
     date: today,
     count: count,
+    counting_enabled: ENABLE_INVOCATION_COUNTING,
+    max_payload_chars: MAX_TUNNEL_PAYLOAD_CHARS,
+    relay_count: RELAY_URLS.length,
     version: FORWARDER_VERSION,
     protocol: PROTOCOL_VERSION,
   };
@@ -98,7 +136,7 @@ function pacificDateKey_() {
 // bumpInvocationCount_ records one invocation in PropertiesService keyed by
 // today's PT date. Best-effort: under high concurrency two requests may read
 // the same value and write the same incremented number, slightly under-counting.
-// That's acceptable for an informational counter — adding a LockService gate
+// That's acceptable for an informational counter; adding a LockService gate
 // would add tens of ms to every tunnel request, which costs more than perfect
 // accuracy is worth.
 function bumpInvocationCount_() {
@@ -108,8 +146,9 @@ function bumpInvocationCount_() {
     const key = 'count_' + today;
     const raw = props.getProperty(key);
     if (raw === null) {
-      // First request of a new day — purge yesterday's keys so the property
-      // store doesn't grow unbounded (capped at 9 KB / 500 entries by Google).
+      // First request of a new day; purge yesterday's keys so the property
+      // store doesn't grow unbounded (Google documents 9 KB per value and
+      // 500 KB total storage per property store).
       pruneStaleCounts_(props, today);
     }
     const cur = raw === null ? 0 : parseInt(raw, 10);
