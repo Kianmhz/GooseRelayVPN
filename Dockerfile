@@ -19,7 +19,7 @@ WORKDIR /app
 COPY --from=builder /out/goose-server /app/goose-server
 COPY server_config.example.json /app/server_config.example.json
 
-EXPOSE 8443
+EXPOSE 3109
 
 ENTRYPOINT ["/app/goose-server"]
 CMD ["-config", "/app/server_config.json"]
